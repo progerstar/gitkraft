@@ -88,7 +88,7 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             commands::refresh_repo(path, depth)
         }),
 
-        Message::RepoRefreshed(result) => handle_repo_loaded(state, result),
+        Message::RepoRefreshed(path, result) => handle_tab_reloaded(state, &path, result),
 
         Message::OpenRecentRepo(path) => {
             // Canonicalize for consistent comparison with stored paths.
@@ -162,23 +162,50 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
 
         Message::MoreCommitsLoaded(result) => handle_more_commits_loaded(state, result),
 
-        Message::GitOperationResult(result) => handle_repo_loaded(state, result),
+        Message::GitOperationResult(path, result) => handle_tab_reloaded(state, &path, result),
+
+        Message::RemoteOpDone(path, done, result) => {
+            let Some(idx) = state.tab_index_of(&path) else {
+                return Task::none();
+            };
+            state.tabs[idx].remote_busy = false;
+            let ok = result.is_ok();
+            let task = handle_tab_reloaded(state, &path, result);
+            if ok {
+                state.tabs[idx].status_message = Some(done);
+            }
+            task
+        }
+
+        Message::AutoFetchDone(path, result) => {
+            let Some(idx) = state.tab_index_of(&path) else {
+                return Task::none();
+            };
+            state.tabs[idx].auto_fetching = false;
+            match result {
+                Ok(payload) => {
+                    // Silent: what the tab shows (an operation's status, an
+                    // error) stays, and so does a running operation's spinner.
+                    let tab = &mut state.tabs[idx];
+                    let shown = (tab.status_message.take(), tab.error_message.take());
+                    let task = apply_loaded(state, idx, payload, path);
+                    let tab = &mut state.tabs[idx];
+                    (tab.status_message, tab.error_message) = shown;
+                    task
+                }
+                // Offline or credentials needed: try again next time.
+                Err(_) => Task::none(),
+            }
+        }
 
         _ => Task::none(),
     }
 }
 
-/// Shared handler for both `RepoOpened` and `RepoRefreshed` — they carry the
-/// same payload and should update the same state fields.
+/// Handler for `RepoOpened`.
 ///
-/// When a refresh result arrives, the active tab may have changed since the
-/// refresh was initiated (e.g. the user opened a new tab). To prevent writing
-/// the payload into the wrong tab, we resolve the target tab by matching the
-/// repo path from the payload against all open tabs, falling back to the active
-/// tab only for brand-new opens (where no tab has that path yet).
-///
-/// Persistence (recording the repo open and refreshing the recent-repos list)
-/// is dispatched as an async [`Task`] so the settings file I/O never blocks the UI.
+/// The payload goes to the tab that already shows its repo path, falling back
+/// to the active tab for brand-new opens (where no tab has that path yet).
 fn handle_repo_loaded(state: &mut GitKraft, result: Result<RepoPayload, String>) -> Task<Message> {
     match result {
         Ok(payload) => {
@@ -190,47 +217,9 @@ fn handle_repo_loaded(state: &mut GitKraft, result: Result<RepoPayload, String>)
                 .clone()
                 .unwrap_or_else(|| payload.info.path.clone());
             let path = path.canonicalize().unwrap_or(path);
-
-            // Find the tab that owns this repo path. If none match (brand-new
-            // open), fall back to the active tab.
-            let target_idx = state
-                .tabs
-                .iter()
-                .position(|t| t.repo_path.as_deref() == Some(path.as_path()))
-                .unwrap_or(state.active_tab);
-
-            let tab = &mut state.tabs[target_idx];
-            // Detect whether this is a refresh (tab already had a repo) or a
-            // brand-new open so we can decide whether to reset the scroll.
-            let is_new_open = tab.repo_info.is_none();
-            tab.is_loading = false;
-            tab.apply_payload(payload, path.clone());
-            // Always rebuild commit_display after apply_payload.
-            // The previous "only rebuild when count changes" optimisation
-            // skipped the rebuild after amend/rebase/force-push where the
-            // commit count stays the same but the content changes, leaving
-            // stale author names and timestamps in the display.
-            // compute_commit_display is O(n) string formatting — fast enough
-            // to run unconditionally even for large histories.
-            tab.commit_display = compute_commit_display(&tab.commits);
-            tab.branch_context = compute_branch_context(&tab.commits, &tab.graph_rows);
-
-            // Record the repo open AND persist the full session in one atomic
-            // write, on a background thread so settings file I/O never blocks the UI.
-            let (open_tabs, active) = state.session_state();
-            let mut tasks = vec![commands::record_repo_and_save_session_async(
-                path, open_tabs, active,
-            )];
-
-            // Only scroll to the top for brand-new opens; background refreshes
-            // must preserve the user's current scroll position.
-            if is_new_open {
-                tasks.push(iced::widget::operation::scroll_to(
-                    crate::features::commits::view::commit_log_scroll_id(target_idx),
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
-                ));
-            }
-            Task::batch(tasks)
+            let target_idx = state.tab_index_of(&path).unwrap_or(state.active_tab);
+            state.tabs[target_idx].is_loading = false;
+            apply_loaded(state, target_idx, payload, path)
         }
         Err(e) => {
             let tab = state.active_tab_mut();
@@ -240,6 +229,73 @@ fn handle_repo_loaded(state: &mut GitKraft, result: Result<RepoPayload, String>)
             Task::none()
         }
     }
+}
+
+/// Handler for a refresh or a git operation in the repo at `path`.
+///
+/// The result goes to the tab showing that repo even when the user switched
+/// tabs meanwhile (a push can take a while), and nowhere if it was closed.
+fn handle_tab_reloaded(
+    state: &mut GitKraft,
+    path: &std::path::Path,
+    result: Result<RepoPayload, String>,
+) -> Task<Message> {
+    let Some(idx) = state.tab_index_of(path) else {
+        return Task::none();
+    };
+    let tab = &mut state.tabs[idx];
+    tab.is_loading = false;
+    match result {
+        Ok(payload) => apply_loaded(state, idx, payload, path.to_path_buf()),
+        Err(e) => {
+            tab.error_message = Some(e);
+            tab.status_message = None;
+            Task::none()
+        }
+    }
+}
+
+/// Put a freshly loaded `payload` for the repo at `path` into tab `idx`.
+///
+/// Persistence (recording the repo open and refreshing the recent-repos list)
+/// is dispatched as an async [`Task`] so the settings file I/O never blocks the UI.
+fn apply_loaded(
+    state: &mut GitKraft,
+    idx: usize,
+    payload: RepoPayload,
+    path: std::path::PathBuf,
+) -> Task<Message> {
+    let tab = &mut state.tabs[idx];
+    // Detect whether this is a refresh (tab already had a repo) or a
+    // brand-new open so we can decide whether to reset the scroll.
+    let is_new_open = tab.repo_info.is_none();
+    tab.apply_payload(payload, path.clone());
+    // Always rebuild commit_display after apply_payload.
+    // The previous "only rebuild when count changes" optimisation
+    // skipped the rebuild after amend/rebase/force-push where the
+    // commit count stays the same but the content changes, leaving
+    // stale author names and timestamps in the display.
+    // compute_commit_display is O(n) string formatting — fast enough
+    // to run unconditionally even for large histories.
+    tab.commit_display = compute_commit_display(&tab.commits);
+    tab.branch_context = compute_branch_context(&tab.commits, &tab.graph_rows);
+
+    // Record the repo open AND persist the full session in one atomic
+    // write, on a background thread so settings file I/O never blocks the UI.
+    let (open_tabs, active) = state.session_state();
+    let mut tasks = vec![commands::record_repo_and_save_session_async(
+        path, open_tabs, active,
+    )];
+
+    // Only scroll to the top for brand-new opens; background refreshes
+    // must preserve the user's current scroll position.
+    if is_new_open {
+        tasks.push(iced::widget::operation::scroll_to(
+            crate::features::commits::view::commit_log_scroll_id(idx),
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+        ));
+    }
+    Task::batch(tasks)
 }
 
 /// Like `handle_repo_loaded` but writes into a specific tab index.

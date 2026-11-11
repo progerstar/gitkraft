@@ -397,6 +397,8 @@ fn push_after_commit(state: &mut GitKraft) -> Task<Message> {
         Some("no remote configured")
     } else if tab.current_branch.is_none() {
         Some("detached HEAD")
+    } else if tab.remote_busy {
+        Some("another fetch, pull or push is running")
     } else {
         None
     };
@@ -407,11 +409,9 @@ fn push_after_commit(state: &mut GitKraft) -> Task<Message> {
     }
     let remote = tab.default_remote();
     let branch = tab.current_branch.clone().unwrap_or_default();
-    with_repo!(
-        state,
-        loading,
+    state.start_remote_op(
         format!("Commit created. Pushing '{branch}' to {remote}…"),
-        |path| crate::features::repo::commands::push_branch_async(path, branch, remote)
+        |path| crate::features::repo::commands::push_branch_async(path, branch, remote),
     )
 }
 

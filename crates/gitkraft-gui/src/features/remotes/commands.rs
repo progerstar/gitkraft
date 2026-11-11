@@ -10,17 +10,14 @@ use iced::Task;
 use crate::macros::StringErr;
 use crate::message::Message;
 
-/// Fetch from a named remote.
+/// Fetch from a named remote, then reload the repo.
 ///
 /// If the remote doesn't exist or authentication is required, the task resolves
 /// to an error message.
 pub(crate) fn fetch_remote(path: PathBuf, remote_name: String) -> Task<Message> {
-    git_task!(
-        Message::FetchCompleted,
-        (|| {
-            // System git, not libgit2: respects credential helpers and the SSH agent.
-            let wd = crate::features::repo::commands::workdir(&path)?;
-            gitkraft_core::features::branches::fetch_remote_cli(&wd, &remote_name).str_err()
-        })()
-    )
+    remote_op_then_reload!(path, "Fetch completed.".to_string(), |wd| {
+        // System git, not libgit2: respects credential helpers and the SSH agent.
+        gitkraft_core::features::branches::fetch_remote_cli(&wd, &remote_name)
+            .map_err(|e| format!("Fetch failed: {e}"))
+    })
 }

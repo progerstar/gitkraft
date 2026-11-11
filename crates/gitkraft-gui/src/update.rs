@@ -66,16 +66,16 @@ impl GitKraft {
             | Message::RepoInitSelected(_)
             | Message::RepoOpened(_)
             | Message::RefreshRepo
-            | Message::RepoRefreshed(_)
+            | Message::RepoRefreshed(..)
             | Message::OpenRecentRepo(_)
             | Message::CloseRepo
             | Message::RepoRecorded(_)
             | Message::RepoRestoredAt(_, _)
             | Message::MoreCommitsLoaded(_)
             | Message::SettingsLoaded(_)
-            | Message::GitOperationResult(_) => {
-                crate::features::repo::update::update(self, message)
-            }
+            | Message::GitOperationResult(..)
+            | Message::RemoteOpDone(..)
+            | Message::AutoFetchDone(..) => crate::features::repo::update::update(self, message),
 
             // ── Branches ──────────────────────────────────────────────────
             Message::CheckoutBranch(_)
@@ -177,9 +177,7 @@ impl GitKraft {
             | Message::StashDiffLoaded(_) => crate::features::stash::update::update(self, message),
 
             // ── Remotes ───────────────────────────────────────────────────
-            Message::Fetch | Message::FetchCompleted(_) => {
-                crate::features::remotes::update::update(self, message)
-            }
+            Message::Fetch => crate::features::remotes::update::update(self, message),
 
             // ── UI / misc ─────────────────────────────────────────────────
             Message::LoadStagingFileDiff(_, _)
@@ -724,43 +722,32 @@ impl GitKraft {
                 let name = name.clone();
                 let remote = self.active_tab().default_remote();
                 self.dismiss_menu();
-                with_repo!(
-                    self,
-                    loading,
-                    format!("Pushing '{name}' to {remote}…"),
-                    |path| crate::features::repo::commands::push_branch_async(path, name, remote)
-                )
+                self.start_remote_op(format!("Pushing '{name}' to {remote}…"), |path| {
+                    crate::features::repo::commands::push_branch_async(path, name, remote)
+                })
             }
 
             Message::ForcePushBranch => {
                 let branch = self.active_tab().current_branch.clone().unwrap_or_default();
                 let remote = self.active_tab().default_remote();
-                with_repo!(
-                    self,
-                    loading,
-                    format!("Force pushing '{branch}' to {remote}…"),
-                    |path| crate::features::repo::commands::force_push_branch_async(
-                        path, branch, remote
-                    )
-                )
+                self.start_remote_op(format!("Force pushing '{branch}' to {remote}…"), |path| {
+                    crate::features::repo::commands::force_push_branch_async(path, branch, remote)
+                })
             }
 
             Message::PullBranch(_name) => {
                 let remote = self.active_tab().default_remote();
                 self.dismiss_menu();
-                with_repo!(
-                    self,
-                    loading,
-                    format!("Pulling from {remote} (rebase)…"),
-                    |path| crate::features::repo::commands::pull_rebase_async(path, remote)
-                )
+                self.start_remote_op(format!("Pulling from {remote} (rebase)…"), |path| {
+                    crate::features::repo::commands::pull_rebase_async(path, remote)
+                })
             }
 
             Message::PullMerge => {
                 let remote = self.active_tab().default_remote();
                 self.dismiss_menu();
-                with_repo!(self, loading, format!("Pulling from {remote}…"), |path| {
-                    crate::features::repo::commands::pull_merge_async(path)
+                self.start_remote_op(format!("Pulling from {remote}…"), |path| {
+                    crate::features::repo::commands::pull_merge_async(path, remote)
                 })
             }
 
@@ -809,12 +796,9 @@ impl GitKraft {
             Message::DeleteRemoteBranch(name) => {
                 let name = name.clone();
                 self.dismiss_menu();
-                with_repo!(
-                    self,
-                    loading,
-                    format!("Deleting remote branch '{name}'…"),
-                    |path| crate::features::repo::commands::delete_remote_branch_async(path, name)
-                )
+                self.start_remote_op(format!("Deleting remote branch '{name}'…"), |path| {
+                    crate::features::repo::commands::delete_remote_branch_async(path, name)
+                })
             }
 
             Message::BeginCreateTag(oid, annotated) => {
@@ -1023,17 +1007,22 @@ impl GitKraft {
 
             Message::AutoFetchTick => {
                 // Like GitHub Desktop: keep remote-tracking refs fresh so the
-                // tabs can show what there is to pull.
-                let tasks: Vec<Task<Message>> = self
-                    .tabs
-                    .iter()
-                    .filter(|t| !t.remotes.is_empty() && !t.is_loading)
-                    .filter_map(|t| {
-                        t.repo_path.clone().map(|p| {
-                            crate::features::repo::commands::auto_fetch(p, t.commits.len())
-                        })
-                    })
-                    .collect();
+                // tabs can show what there is to pull. Skip a repo whose last
+                // fetch is still running, or where the user's own fetch, pull
+                // or push is about to update the same refs.
+                let mut tasks = Vec::new();
+                for tab in &mut self.tabs {
+                    if tab.remotes.is_empty() || tab.remote_busy || tab.auto_fetching {
+                        continue;
+                    }
+                    if let Some(path) = tab.repo_path.clone() {
+                        tab.auto_fetching = true;
+                        tasks.push(crate::features::repo::commands::auto_fetch(
+                            path,
+                            tab.commits.len(),
+                        ));
+                    }
+                }
                 Task::batch(tasks)
             }
 

@@ -57,7 +57,8 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
     // ── Fetch button ──────────────────────────────────────────────────────
     let fetch_icon = icon!(icons::CLOUD_ARROW_DOWN, 14, c.accent);
 
-    let fetch_msg = (!tab.remotes.is_empty()).then_some(Message::Fetch);
+    // One fetch, pull or push at a time.
+    let fetch_msg = (!tab.remotes.is_empty() && !tab.remote_busy).then_some(Message::Fetch);
     let fetch_btn = crate::view_utils::on_press_maybe(
         button(if compact {
             row![fetch_icon].align_y(Alignment::Center)
@@ -86,11 +87,11 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
         content = content
             .push(Space::new().width(4))
             .push(text(count.to_string()).size(12).color(color));
-        let btn: Element<'_, Message> = button(content)
+        let btn = button(content)
             .padding([4, if compact { 8 } else { 10 }])
-            .style(theme::toolbar_button)
-            .on_press(msg)
-            .into();
+            .style(theme::toolbar_button);
+        let btn: Element<'_, Message> =
+            crate::view_utils::on_press_maybe(btn, (!tab.remote_busy).then_some(msg)).into();
         btn
     };
     let sync_btn: Element<'_, Message> = if behind > 0 {

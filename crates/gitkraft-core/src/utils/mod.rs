@@ -1,5 +1,6 @@
 //! Utility helpers shared across the crate — OID formatting, relative time, text, etc.
 
+pub(crate) mod process;
 pub mod text;
 pub mod time;
 

@@ -203,6 +203,12 @@ pub struct RepoTab {
     pub error_message: Option<String>,
     /// True while an async operation is in flight.
     pub is_loading: bool,
+    /// A fetch, pull or push the user started is running; another one cannot
+    /// start until it finishes.
+    pub remote_busy: bool,
+    /// A background fetch is running. It does not block the user's own
+    /// fetch, pull or push: core runs those after it.
+    pub auto_fetching: bool,
     /// Cursor position captured at the moment the context menu was opened.
     /// Used to anchor the menu so it doesn't follow the mouse after appearing.
     pub context_menu_pos: (f32, f32),
@@ -324,6 +330,8 @@ impl RepoTab {
             status_message: None,
             error_message: None,
             is_loading: false,
+            remote_busy: false,
+            auto_fetching: false,
             context_menu: None,
             context_menu_pos: (0.0, 0.0),
             rename_branch_target: None,
@@ -943,6 +951,35 @@ impl GitKraft {
     /// Get a mutable reference to the currently active tab.
     pub fn active_tab_mut(&mut self) -> &mut RepoTab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// Index of the tab showing the repository at `path`.
+    pub fn tab_index_of(&self, path: &std::path::Path) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|t| t.repo_path.as_deref() == Some(path))
+    }
+
+    /// Start a fetch, pull or push in the active tab; `op` gets the repo path
+    /// and must end in [`Message::RemoteOpDone`]. Refused while another one
+    /// the user started is still running there.
+    pub(crate) fn start_remote_op(
+        &mut self,
+        status: String,
+        op: impl FnOnce(PathBuf) -> Task<Message>,
+    ) -> Task<Message> {
+        let tab = self.active_tab_mut();
+        let Some(path) = tab.repo_path.clone() else {
+            return Task::none();
+        };
+        if tab.remote_busy {
+            tab.status_message = Some("Wait for the running fetch, pull or push to finish.".into());
+            return Task::none();
+        }
+        tab.remote_busy = true;
+        tab.is_loading = true;
+        tab.status_message = Some(status);
+        op(path)
     }
 
     /// Dismiss any open context menu.
@@ -2516,7 +2553,10 @@ mod tests {
 
         // Simulate: a RepoRefreshed result arrives for repo-a while tab 1 is active.
         let payload = fake_payload("/home/user/repo-a");
-        let _task = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _task = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // The payload must land in tab 0 (which owns repo-a), NOT tab 1.
         assert!(
@@ -2574,7 +2614,10 @@ mod tests {
 
         // A refresh result for repo-a arrives (was triggered before the tab switch).
         let payload = fake_payload("/home/user/repo-a");
-        let _task = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _task = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // Tab 1 must remain empty — the payload should go to tab 0.
         assert!(
@@ -2606,7 +2649,10 @@ mod tests {
         // A git operation result arrives for repo-a (e.g. push completed)
         // while user is on tab 1.
         let payload = fake_payload("/home/user/repo-a");
-        let _task = state.update(Message::GitOperationResult(Ok(payload)));
+        let _task = state.update(Message::GitOperationResult(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // Payload should land in tab 0 (repo-a), not tab 1.
         assert_eq!(state.tabs[0].current_branch.as_deref(), Some("main"));
@@ -2615,6 +2661,146 @@ mod tests {
             state.tabs[1].repo_path.as_deref(),
             Some(std::path::Path::new("/home/user/repo-b"))
         );
+    }
+
+    /// Tabs 0 = repo-a and 1 = repo-b (active), both with an `origin` remote.
+    fn two_repo_tabs() -> GitKraft {
+        let mut state = GitKraft::new();
+        setup_loaded_tab(state.active_tab_mut(), "/home/user/repo-a");
+        state.tabs.push(RepoTab::new_empty());
+        setup_loaded_tab(&mut state.tabs[1], "/home/user/repo-b");
+        for tab in &mut state.tabs {
+            tab.remotes = vec![gitkraft_core::RemoteInfo {
+                name: "origin".into(),
+                url: None,
+                fetch_refspecs: Vec::new(),
+            }];
+        }
+        state.active_tab = 1;
+        state
+    }
+
+    #[test]
+    fn git_operation_error_targets_its_tab() {
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.tabs[0].is_loading = true;
+
+        let _ = state.update(Message::GitOperationResult(
+            PathBuf::from("/home/user/repo-a"),
+            Err("rejected".into()),
+        ));
+
+        assert_eq!(state.tabs[0].error_message.as_deref(), Some("rejected"));
+        assert!(
+            !state.tabs[0].is_loading,
+            "repo-a's tab must not stay loading"
+        );
+        assert!(state.tabs[1].error_message.is_none());
+    }
+
+    #[test]
+    fn result_for_a_closed_tab_is_dropped() {
+        use crate::message::Message;
+        let mut state = GitKraft::new();
+        setup_loaded_tab(state.active_tab_mut(), "/home/user/repo-b");
+
+        let payload = fake_payload("/home/user/repo-a");
+        let path = PathBuf::from("/home/user/repo-a");
+        let _ = state.update(Message::RepoRefreshed(path.clone(), Ok(payload)));
+        let _ = state.update(Message::GitOperationResult(path, Err("gone".into())));
+
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(
+            state.tabs[0].repo_path.as_deref(),
+            Some(std::path::Path::new("/home/user/repo-b"))
+        );
+        assert!(state.tabs[0].error_message.is_none());
+    }
+
+    #[test]
+    fn remote_op_runs_one_at_a_time_and_finishes_in_its_tab() {
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.active_tab = 0;
+
+        let _ = state.update(Message::Fetch);
+        assert!(state.tabs[0].remote_busy && state.tabs[0].is_loading);
+        // A second one is refused while the first runs.
+        let _ = state.update(Message::PullMerge);
+        assert_eq!(
+            state.tabs[0].status_message.as_deref(),
+            Some("Wait for the running fetch, pull or push to finish.")
+        );
+
+        // The user switches tabs before the fetch finishes.
+        state.active_tab = 1;
+        let _ = state.update(Message::RemoteOpDone(
+            PathBuf::from("/home/user/repo-a"),
+            "Fetch completed.".into(),
+            Ok(fake_payload("/home/user/repo-a")),
+        ));
+
+        let (a, b) = (&state.tabs[0], &state.tabs[1]);
+        assert!(!a.remote_busy && !a.is_loading);
+        assert_eq!(a.status_message.as_deref(), Some("Fetch completed."));
+        assert!(b.status_message.is_none() && !b.remote_busy);
+    }
+
+    #[test]
+    fn remote_op_error_shows_in_its_tab() {
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.tabs[0].remote_busy = true;
+        state.tabs[0].is_loading = true;
+
+        let _ = state.update(Message::RemoteOpDone(
+            PathBuf::from("/home/user/repo-a"),
+            "Pushed 'main' to origin.".into(),
+            Err("ssh: connect to host example.com port 22: No route to host".into()),
+        ));
+
+        let a = &state.tabs[0];
+        assert!(!a.remote_busy && !a.is_loading);
+        assert_eq!(
+            a.error_message.as_deref(),
+            Some("ssh: connect to host example.com port 22: No route to host")
+        );
+        assert!(state.tabs[1].error_message.is_none());
+    }
+
+    #[test]
+    fn auto_fetch_skips_busy_repos_and_leaves_messages_alone() {
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.tabs[1].remote_busy = true;
+
+        let _ = state.update(Message::AutoFetchTick);
+        assert!(state.tabs[0].auto_fetching);
+        assert!(
+            !state.tabs[1].auto_fetching,
+            "no background fetch next to the user's push"
+        );
+
+        // A push starts in repo-a while its background fetch runs…
+        state.tabs[0].is_loading = true;
+        state.tabs[0].status_message = Some("Pushing 'main' to origin…".into());
+        state.tabs[0].error_message = Some("earlier error".into());
+        // …and the fetch finishes first.
+        let _ = state.update(Message::AutoFetchDone(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(fake_payload("/home/user/repo-a")),
+        ));
+
+        let a = &state.tabs[0];
+        assert!(!a.auto_fetching);
+        assert!(a.is_loading, "the push is still running");
+        assert_eq!(
+            a.status_message.as_deref(),
+            Some("Pushing 'main' to origin…")
+        );
+        assert_eq!(a.error_message.as_deref(), Some("earlier error"));
+        assert_eq!(a.current_branch.as_deref(), Some("main"), "payload applied");
     }
 
     #[test]
@@ -2632,7 +2818,10 @@ mod tests {
 
         // Refresh arrives for repo-a.
         let payload = fake_payload("/home/user/repo-a");
-        let _task = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _task = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // Only tab 0 should be affected.
         assert!(state.tabs[0].repo_info.is_some());
@@ -3512,7 +3701,10 @@ mod tests {
 
         // Background refresh arrives
         let payload = fake_payload("/home/user/repo-a");
-        let _ = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _ = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // is_loading_more_commits must still be true
         assert!(
@@ -3565,7 +3757,10 @@ mod tests {
             "payload must be shorter for this test"
         );
 
-        let _ = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _ = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         assert_eq!(
             state.active_tab().commits.len(),
@@ -3591,7 +3786,10 @@ mod tests {
         new_commits[0].oid = "refreshed_oid_0000".to_string();
         payload.commits = new_commits;
         payload.graph_rows = gitkraft_core::features::graph::build_graph(&payload.commits);
-        let _ = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _ = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         assert_eq!(
             state.active_tab().commits[0].oid,
@@ -3628,7 +3826,10 @@ mod tests {
         new_commits[0].author_name = "Bob".to_string();
         payload.commits = new_commits;
         payload.graph_rows = gitkraft_core::features::graph::build_graph(&payload.commits);
-        let _ = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _ = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         // commit_display must reflect the new author, not the stale one.
         assert_eq!(
@@ -3711,7 +3912,10 @@ mod tests {
         state.active_tab_mut().has_more_commits = true;
 
         let payload = fake_payload("/home/user/repo-a");
-        let _ = state.update(Message::RepoRefreshed(Ok(payload)));
+        let _ = state.update(Message::RepoRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(payload),
+        ));
 
         assert!(
             state.active_tab().has_more_commits,

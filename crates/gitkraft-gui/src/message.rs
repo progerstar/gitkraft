@@ -55,8 +55,8 @@ pub enum Message {
     RepoOpened(Result<RepoPayload, String>),
     /// User requested a full refresh of the current repo.
     RefreshRepo,
-    /// Async refresh completed.
-    RepoRefreshed(Result<RepoPayload, String>),
+    /// Async refresh of the repository at the path completed.
+    RepoRefreshed(PathBuf, Result<RepoPayload, String>),
 
     // ── Branches ──────────────────────────────────────────────────────────
     /// User clicked a branch name → checkout that branch.
@@ -167,6 +167,9 @@ pub enum Message {
     CloseBranchPopup,
     /// Time for a background fetch of every open repository with a remote.
     AutoFetchTick,
+    /// A background fetch of the repository at the path finished (with the
+    /// reloaded repository, or an error that is not shown).
+    AutoFetchDone(PathBuf, Result<RepoPayload, String>),
 
     // ── Stash ─────────────────────────────────────────────────────────────
     /// Save the current working state as a stash.
@@ -199,8 +202,10 @@ pub enum Message {
     // ── Remotes ───────────────────────────────────────────────────────────
     /// Fetch from the first configured remote.
     Fetch,
-    /// Async fetch completed.
-    FetchCompleted(Result<(), String>),
+    /// A fetch, pull or push the user started in the repository at the path
+    /// finished: the status to show on success, then the reloaded repository
+    /// or git's error.
+    RemoteOpDone(PathBuf, String, Result<RepoPayload, String>),
 
     // ── UI ────────────────────────────────────────────────────────────────
     /// User clicked a file in the commit-diff file list (by index into `commit_files`).
@@ -357,9 +362,10 @@ pub enum Message {
     /// Copy a string to the system clipboard.
     CopyText(String),
 
-    /// Generic result for any git operation that produces a full repo refresh.
-    /// The operation itself is responsible for a descriptive error string.
-    GitOperationResult(Result<RepoPayload, String>),
+    /// Generic result for any git operation in the repository at the path that
+    /// produces a full repo refresh. The operation itself is responsible for a
+    /// descriptive error string.
+    GitOperationResult(PathBuf, Result<RepoPayload, String>),
 
     /// User selected a different theme from the picker (by index into
     /// `gitkraft_core::THEME_NAMES`; `THEME_COUNT` means "follow system").

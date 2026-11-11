@@ -166,30 +166,49 @@ macro_rules! open_repo {
 /// Run a git mutation that requires a `Repository` handle, then reload
 /// the full repo snapshot.  Returns `Task<Message::GitOperationResult>`.
 macro_rules! git_repo_then_reload {
-    ($path:expr_2021, |$repo:ident| $op:expr_2021) => {
+    ($path:expr_2021, |$repo:ident| $op:expr_2021) => {{
+        let on_done = crate::features::repo::commands::reloaded(&$path);
         git_task!(
-            Message::GitOperationResult,
+            on_done,
             (|| {
                 let $repo = open_repo!(&$path);
                 { $op }.str_err()?;
                 crate::features::repo::commands::load_repo_blocking(&$path)
             })()
         )
-    };
+    }};
 }
 
 /// Same as `git_repo_then_reload!` but extracts the workdir first.
 macro_rules! git_wd_then_reload {
-    ($path:expr_2021, |$wd:ident| $op:expr_2021) => {
+    ($path:expr_2021, |$wd:ident| $op:expr_2021) => {{
+        let on_done = crate::features::repo::commands::reloaded(&$path);
         git_task!(
-            Message::GitOperationResult,
+            on_done,
             (|| {
                 let $wd = crate::features::repo::commands::workdir(&$path)?;
                 { $op }.str_err()?;
                 crate::features::repo::commands::load_repo_blocking(&$path)
             })()
         )
-    };
+    }};
+}
+
+/// Run a fetch, pull or push (needs the workdir), then reload the repo.
+/// Returns `Task<Message::RemoteOpDone>` with `$done` as the status shown on
+/// success; start it with `GitKraft::start_remote_op`.
+macro_rules! remote_op_then_reload {
+    ($path:expr_2021, $done:expr_2021, |$wd:ident| $op:expr_2021) => {{
+        let (target, done) = ($path.clone(), $done);
+        git_task!(
+            move |result| Message::RemoteOpDone(target, done, result),
+            (|| {
+                let $wd = crate::features::repo::commands::workdir(&$path)?;
+                { $op }.str_err()?;
+                crate::features::repo::commands::load_repo_blocking(&$path)
+            })()
+        )
+    }};
 }
 
 /// Run a staging operation then refresh the staging state.

@@ -1,10 +1,16 @@
 //! Branch operations — list, create, delete, checkout, and merge branches.
 
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use git2::{BranchType as Git2BranchType, Repository};
 use tracing::debug;
 
 use super::types::{BranchInfo, BranchType};
+use crate::utils::process::output_with_timeout;
 
 /// List all branches (local and remote) in the repository.
 pub fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>> {
@@ -290,11 +296,15 @@ pub fn create_branch_at_commit(repo: &Repository, name: &str, oid_str: &str) -> 
 /// Uses the system `git` binary so that the user's configured credential
 /// helpers (SSH agent, git-credential-manager, etc.) are respected.
 pub fn push_branch(workdir: &std::path::Path, branch: &str, remote: &str) -> Result<()> {
-    run_git(workdir, &["push", remote, branch])
+    run_git_remote(workdir, &["push", remote, branch], StartedBy::User)
 }
 
 pub fn force_push_branch(workdir: &std::path::Path, branch: &str, remote: &str) -> Result<()> {
-    run_git(workdir, &["push", "--force-with-lease", remote, branch])
+    run_git_remote(
+        workdir,
+        &["push", "--force-with-lease", remote, branch],
+        StartedBy::User,
+    )
 }
 
 /// Delete a remote branch using `git push <remote> --delete <branch>`.
@@ -305,7 +315,11 @@ pub fn delete_remote_branch(workdir: &std::path::Path, full_name: &str) -> Resul
     let (remote, branch) = full_name.split_once('/').with_context(|| {
         format!("invalid remote branch name '{full_name}' — expected 'remote/branch'")
     })?;
-    run_git(workdir, &["push", remote, "--delete", branch])
+    run_git_remote(
+        workdir,
+        &["push", remote, "--delete", branch],
+        StartedBy::User,
+    )
 }
 
 /// Checkout a remote branch by creating a local tracking branch.
@@ -321,20 +335,24 @@ pub fn checkout_remote_branch(workdir: &std::path::Path, full_name: &str) -> Res
 
 /// Pull the current branch from a remote with `--rebase`.
 pub fn pull_rebase(workdir: &std::path::Path, remote: &str) -> Result<()> {
-    run_git(workdir, &["pull", "--rebase", remote])
+    run_git_remote(workdir, &["pull", "--rebase", remote], StartedBy::User)
 }
 
 /// Background `git fetch --all --prune` that never asks for credentials:
 /// without a credential helper or SSH agent it simply fails.
 pub fn fetch_all_quiet(workdir: &std::path::Path) -> Result<()> {
-    run_git_no_prompt(workdir, &["fetch", "--all", "--prune", "--quiet"])
+    run_git_remote(
+        workdir,
+        &["fetch", "--all", "--prune", "--quiet"],
+        StartedBy::Background,
+    )
 }
 
 /// `git fetch <remote>` with the system git, so credential helpers (e.g.
 /// `gh auth git-credential`) and the SSH agent work — unlike libgit2's fetch.
-/// Never prompts: there is no terminal to answer in.
+/// Never asks in the terminal: there is nobody to answer there.
 pub fn fetch_remote_cli(workdir: &std::path::Path, remote: &str) -> Result<()> {
-    run_git_no_prompt(workdir, &["fetch", "--prune", remote])
+    run_git_remote(workdir, &["fetch", "--prune", remote], StartedBy::User)
 }
 
 /// Pull the current branch from its upstream like GitHub Desktop: merge the
@@ -347,9 +365,9 @@ pub fn pull_merge(workdir: &std::path::Path) -> Result<()> {
         .output()
         .is_ok_and(|o| o.status.success());
     if rebase_configured {
-        run_git_no_prompt(workdir, &["pull"])
+        run_git_remote(workdir, &["pull"], StartedBy::User)
     } else {
-        run_git_no_prompt(workdir, &["pull", "--no-rebase"])
+        run_git_remote(workdir, &["pull", "--no-rebase"], StartedBy::User)
     }
 }
 
@@ -360,20 +378,32 @@ pub fn merge_ref_cli(workdir: &std::path::Path, refname: &str) -> Result<()> {
 }
 
 /// Run git without any interaction: no credential prompts, no editor for
-/// merge messages. On failure the error carries git's output (conflict
-/// notices go to stdout, the rest to stderr).
+/// merge messages. On failure the error carries git's output.
 fn run_git_no_prompt(workdir: &std::path::Path, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("git")
-        .current_dir(workdir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let output = git_command(workdir, args)
         .env("GCM_INTERACTIVE", "never")
         .env("SSH_ASKPASS_REQUIRE", "never")
-        .env("GIT_MERGE_AUTOEDIT", "no")
-        .env("GIT_EDITOR", "true")
-        .stdin(std::process::Stdio::null())
         .output()
         .context("failed to spawn git")?;
+    check_output(&output)
+}
+
+/// `git <args>` in `workdir` that never waits for an answer in the terminal
+/// (the TUI owns it, the GUI's is out of sight) and never opens an editor.
+fn git_command(workdir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workdir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MERGE_AUTOEDIT", "no")
+        .env("GIT_EDITOR", "true")
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// `Ok` when git succeeded, otherwise an error with git's output (conflict
+/// notices go to stdout, the rest to stderr).
+fn check_output(output: &Output) -> Result<()> {
     if !output.status.success() {
         let text = [output.stdout.as_slice(), output.stderr.as_slice()]
             .iter()
@@ -384,6 +414,147 @@ fn run_git_no_prompt(workdir: &std::path::Path, args: &[&str]) -> Result<()> {
         anyhow::bail!("{text}");
     }
     Ok(())
+}
+
+// ── network commands ──────────────────────────────────────────────────────────
+
+/// Who started a network command: decides what may ask for a password and
+/// how long the command may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartedBy {
+    /// A user action. A graphical askpass (`SSH_ASKPASS`, `core.askPass`,
+    /// git-credential-manager) may ask, as when git runs without a terminal;
+    /// the terminal does not (unless the user's own ssh command asks there).
+    User,
+    /// A background fetch: nothing may ask, it simply fails.
+    Background,
+}
+
+impl StartedBy {
+    /// Longest the command may run. A dead connection is dropped much sooner
+    /// (see [`remote_command`]); this catches what slips through, such as a
+    /// custom `core.sshCommand` that waits forever.
+    fn timeout(self) -> Duration {
+        match self {
+            Self::User => Duration::from_secs(10 * 60),
+            Self::Background => Duration::from_secs(2 * 60),
+        }
+    }
+}
+
+/// Run a git command that talks to a remote. Commands on the same repository
+/// take turns: concurrent fetches and pushes fail on each other's ref locks.
+fn run_git_remote(workdir: &Path, args: &[&str], by: StartedBy) -> Result<()> {
+    let mut cmd = remote_command(workdir, args, by);
+    let _turn = RepoTurn::take(workdir);
+    let timeout = by.timeout();
+    let output = output_with_timeout(&mut cmd, timeout)
+        .context("failed to spawn git")?
+        .with_context(|| {
+            format!(
+                "git {} did not finish within {} min and was stopped",
+                args[0],
+                timeout.as_secs() / 60
+            )
+        })?;
+    check_output(&output)
+}
+
+/// The [`git_command`] for a network command started `by` someone.
+fn remote_command(workdir: &Path, args: &[&str], by: StartedBy) -> Command {
+    let mut cmd = git_command(workdir, args);
+    // An HTTP(S) transfer that moved nothing for a minute is dead: git
+    // servers send keep-alives while they work.
+    for (var, value) in [
+        ("GIT_HTTP_LOW_SPEED_LIMIT", "1"),
+        ("GIT_HTTP_LOW_SPEED_TIME", "60"),
+    ] {
+        if std::env::var_os(var).is_none() {
+            cmd.env(var, value);
+        }
+    }
+    // ssh asks in the terminal when there is one; the askpass dialog instead.
+    let askpass = by == StartedBy::User && std::env::var_os("SSH_ASKPASS").is_some();
+    if askpass {
+        cmd.env("SSH_ASKPASS_REQUIRE", "force");
+    }
+    if by == StartedBy::Background {
+        // An empty GIT_ASKPASS also keeps git from falling back to SSH_ASKPASS.
+        cmd.env("GIT_ASKPASS", "")
+            .env("GCM_INTERACTIVE", "never")
+            .env("SSH_ASKPASS_REQUIRE", "never");
+    }
+    if let Some(ssh) = ssh_command(workdir, !askpass) {
+        cmd.env("GIT_SSH_COMMAND", ssh);
+    }
+    cmd
+}
+
+/// `GIT_SSH_COMMAND` that gives up on a server that does not answer or
+/// stopped answering, and with `batch` never asks anything. `None` on Windows
+/// (Git for Windows brings its own ssh) and when the user set up their own
+/// ssh command, which is then left alone.
+fn ssh_command(workdir: &Path, batch: bool) -> Option<String> {
+    let own_env = ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some());
+    if cfg!(windows) || own_env {
+        return None;
+    }
+    let own_config = Command::new("git")
+        .current_dir(workdir)
+        .args([
+            "config",
+            "--get-regexp",
+            r"^(core\.sshcommand|ssh\.variant)$",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if own_config {
+        return None;
+    }
+    let mut ssh =
+        String::from("ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4");
+    if batch {
+        ssh.push_str(" -o BatchMode=yes");
+    }
+    Some(ssh)
+}
+
+/// Repositories (canonical workdirs) with a network command running.
+static BUSY_REPOS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Signalled whenever a repository leaves [`BUSY_REPOS`].
+static REPO_FREED: Condvar = Condvar::new();
+
+/// A repository's turn to run a network command, held until dropped.
+struct RepoTurn(PathBuf);
+
+impl RepoTurn {
+    /// Wait until no other network command runs in `workdir`, then take the turn.
+    fn take(workdir: &Path) -> Self {
+        let repo = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        let mut busy = BUSY_REPOS.lock().unwrap_or_else(PoisonError::into_inner);
+        while busy.contains(&repo) {
+            busy = REPO_FREED
+                .wait(busy)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        busy.push(repo.clone());
+        Self(repo)
+    }
+}
+
+impl Drop for RepoTurn {
+    fn drop(&mut self) {
+        BUSY_REPOS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|repo| *repo != self.0);
+        REPO_FREED.notify_all();
+    }
 }
 
 /// Rebase the current HEAD onto `target` (branch name or OID).
@@ -721,5 +892,47 @@ mod tests {
         assert!(err.contains("a.txt"), "{err}");
         let repo = Repository::open(&me).unwrap();
         assert!(repo.index().unwrap().has_conflicts());
+    }
+
+    #[test]
+    fn network_commands_on_one_repository_take_turns() {
+        let repo = tempfile::tempdir().unwrap();
+        let first = RepoTurn::take(repo.path());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = repo.path().to_path_buf();
+        let second = std::thread::spawn(move || {
+            let _turn = RepoTurn::take(&path);
+            tx.send(()).unwrap();
+        });
+        // The second command waits while the first one runs…
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        // …while another repository does not wait.
+        let other = tempfile::tempdir().unwrap();
+        drop(RepoTurn::take(other.path()));
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn network_commands_never_ask_in_the_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let var = |by, name: &str| {
+            remote_command(dir.path(), &["fetch"], by)
+                .get_envs()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        for by in [StartedBy::User, StartedBy::Background] {
+            assert_eq!(var(by, "GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
+        }
+        // A user action may still use a graphical askpass; a background fetch may not.
+        assert_eq!(var(StartedBy::User, "GIT_ASKPASS"), None);
+        assert_eq!(
+            var(StartedBy::Background, "GIT_ASKPASS").as_deref(),
+            Some("")
+        );
+        let gcm = var(StartedBy::Background, "GCM_INTERACTIVE");
+        assert_eq!(gcm.as_deref(), Some("never"));
     }
 }

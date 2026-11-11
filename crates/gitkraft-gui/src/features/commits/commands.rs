@@ -209,8 +209,9 @@ pub(crate) fn checkout_file_at_commit(
 
 /// Cherry-pick a sequence of commits onto the current branch.
 pub(crate) fn cherry_pick_commits(path: PathBuf, oids: Vec<String>) -> Task<Message> {
+    let on_done = crate::features::repo::commands::reloaded(&path);
     git_task!(
-        Message::GitOperationResult,
+        on_done,
         (|| {
             for oid in &oids {
                 gitkraft_core::features::commits::cherry_pick_commit(&path, oid)
@@ -223,8 +224,9 @@ pub(crate) fn cherry_pick_commits(path: PathBuf, oids: Vec<String>) -> Task<Mess
 
 /// Revert a sequence of commits in order.
 pub(crate) fn revert_commits(path: PathBuf, oids: Vec<String>) -> Task<Message> {
+    let on_done = crate::features::repo::commands::reloaded(&path);
     git_task!(
-        Message::GitOperationResult,
+        on_done,
         (|| {
             for oid in &oids {
                 gitkraft_core::features::repo::revert_commit(&path, oid)
@@ -257,8 +259,9 @@ pub(crate) fn checkout_multi_files_at_commit(
     oid: String,
     file_paths: Vec<String>,
 ) -> Task<Message> {
+    let on_done = crate::features::repo::commands::reloaded(&path);
     git_task!(
-        Message::GitOperationResult,
+        on_done,
         (|| {
             let repo = open_repo!(&path);
             for fp in &file_paths {

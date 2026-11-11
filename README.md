@@ -30,8 +30,10 @@ the [original README](https://github.com/sorinirimies/gitkraft#readme).
   rebases if git's `pull.rebase` is set) or **Push origin ↑n**. Open repositories are
   fetched in the background (10 s after start, then every 5 minutes); fetches that would
   need a password are skipped. A remote branch's menu has *Merge into current branch*.
-- **Fetch / pull / merge use the system git**, so credential helpers (e.g. `gh`) and the
-  SSH agent work, and git's own message is shown on errors.
+- **Fetch / pull / push / merge use the system git**, so credential helpers (e.g. `gh`) and
+  the SSH agent work, and git's own message is shown on errors. A password is asked for
+  only through a graphical askpass (`SSH_ASKPASS`), never in the terminal; a connection that
+  stops answering is dropped after about a minute.
 - **Image diffs.** PNG, JPEG, GIF, WebP, BMP, ICO and SVG are shown before / after, side by
   side, with pixel and file sizes. SVG can be switched to its text diff.
 - **AI commit message.** The ✨ button sends the staged changes (a list of all files plus

@@ -23,7 +23,7 @@ pub(crate) fn view(state: &GitKraft) -> Element<'_, Message> {
 
     let fetch_icon = icon!(icons::CLOUD_ARROW_DOWN, 14, c.accent);
 
-    let fetch_msg = (!tab.remotes.is_empty()).then_some(Message::Fetch);
+    let fetch_msg = (!tab.remotes.is_empty() && !tab.remote_busy).then_some(Message::Fetch);
     let fetch_btn = crate::view_utils::on_press_maybe(
         button(fetch_icon).padding([2, 6]).style(theme::icon_button),
         fetch_msg,

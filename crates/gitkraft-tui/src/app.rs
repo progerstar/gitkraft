@@ -118,8 +118,13 @@ pub enum BackgroundResult {
         path: PathBuf,
         result: Result<RepoPayload, String>,
     },
-    /// A fetch completed.
-    FetchDone(Result<(), String>),
+    /// A fetch, pull or push in the repo at `path` finished, with the status
+    /// to show or git's error. Applied to that repo's tab, which need not be
+    /// the active one any more.
+    RemoteOpDone {
+        path: PathBuf,
+        result: Result<String, String>,
+    },
     /// A commit-diff load completed.
     CommitDiffLoaded(Result<Vec<DiffInfo>, String>),
     /// A staging-only refresh completed (unstaged + staged diffs reloaded).
@@ -278,6 +283,10 @@ pub struct RepoTab {
     /// True while a background task is in flight for this tab.
     pub is_loading: bool,
 
+    /// A fetch, pull or push is running; another one cannot start until it
+    /// finishes.
+    pub remote_busy: bool,
+
     /// When true, the next d press actually discards; otherwise the first
     /// d sets this flag and shows a confirmation prompt.
     pub confirm_discard: bool,
@@ -374,6 +383,8 @@ impl RepoTab {
             error_message: None,
 
             is_loading: false,
+
+            remote_busy: false,
 
             confirm_discard: false,
 
@@ -782,15 +793,20 @@ impl App {
     }
 
     fn refresh_internal(&mut self) {
-        let path = match self.tab().repo_path.clone() {
-            Some(p) => p,
-            None => {
-                self.tab_mut().error_message = Some("No repository open".into());
-                self.tab_mut().is_loading = false;
-                return;
-            }
-        };
+        if self.tab().repo_path.is_none() {
+            self.tab_mut().error_message = Some("No repository open".into());
+            self.tab_mut().is_loading = false;
+            return;
+        }
+        self.reload_tab(self.active_tab_index);
+    }
 
+    /// Reload tab `idx` in the background, leaving its messages alone.
+    fn reload_tab(&mut self, idx: usize) {
+        let Some(path) = self.tabs[idx].repo_path.clone() else {
+            return;
+        };
+        self.tabs[idx].is_loading = true;
         let tx = self.bg_tx.clone();
         std::thread::spawn(move || {
             let result = load_repo_blocking(&path);
@@ -864,15 +880,26 @@ impl App {
                         }
                     }
                 }
-                BackgroundResult::FetchDone(res) => {
-                    self.tab_mut().is_loading = false;
-                    match res {
-                        Ok(()) => {
-                            self.tab_mut().status_message = Some("Fetched from origin".into());
-                            self.refresh();
+                BackgroundResult::RemoteOpDone { path, result } => {
+                    let Some(idx) = self
+                        .tabs
+                        .iter()
+                        .position(|t| t.repo_path.as_ref() == Some(&path))
+                    else {
+                        continue; // the tab was closed meanwhile
+                    };
+                    let tab = &mut self.tabs[idx];
+                    tab.remote_busy = false;
+                    tab.is_loading = false;
+                    match result {
+                        Ok(msg) => tab.status_message = Some(msg),
+                        Err(e) => {
+                            tab.error_message = Some(e);
+                            tab.status_message = None;
                         }
-                        Err(e) => self.tab_mut().error_message = Some(format!("fetch: {e}")),
                     }
+                    // Also after an error: a failed pull can leave conflicts.
+                    self.reload_tab(idx);
                 }
                 BackgroundResult::CommitDiffLoaded(res) => {
                     self.tab_mut().is_loading = false;
@@ -1339,17 +1366,11 @@ impl App {
             return;
         }
         let name = branch.name.clone();
-        bg_op!(
-            self,
-            format!("Deleting remote {name}\u{2026}"),
-            refresh,
-            |repo_path| {
-                let path = std::path::Path::new(&repo_path);
-                gitkraft_core::features::branches::delete_remote_branch(path, &name)
-                    .map_err(|e| format!("delete remote: {e}"))?;
-                Ok(format!("Deleted remote branch: {name}"))
-            }
-        );
+        self.remote_op(format!("Deleting remote {name}\u{2026}"), move |path| {
+            gitkraft_core::features::branches::delete_remote_branch(path, &name)
+                .map_err(|e| format!("delete remote: {e}"))?;
+            Ok(format!("Deleted remote branch: {name}"))
+        });
     }
 
     /// Enter input mode to rename the currently selected branch.
@@ -1413,17 +1434,11 @@ impl App {
             return;
         }
         let name = branch.name.clone();
-        bg_op!(
-            self,
-            format!("Pushing {name}\u{2026}"),
-            refresh,
-            |repo_path| {
-                let path = std::path::Path::new(&repo_path);
-                gitkraft_core::features::branches::push_branch(path, &name, "origin")
-                    .map_err(|e| format!("push: {e}"))?;
-                Ok(format!("Pushed '{name}'"))
-            }
-        );
+        self.remote_op(format!("Pushing {name}\u{2026}"), move |path| {
+            gitkraft_core::features::branches::push_branch(path, &name, "origin")
+                .map_err(|e| format!("push: {e}"))?;
+            Ok(format!("Pushed '{name}'"))
+        });
     }
 
     /// Pull (rebase) the selected branch (from the branches pane) from origin.
@@ -1441,17 +1456,11 @@ impl App {
             return;
         }
         let name = branch.name.clone();
-        bg_op!(
-            self,
-            format!("Pulling {name}\u{2026}"),
-            refresh,
-            |repo_path| {
-                let path = std::path::Path::new(&repo_path);
-                gitkraft_core::features::branches::pull_rebase(path, "origin")
-                    .map_err(|e| format!("pull: {e}"))?;
-                Ok(format!("Pulled '{name}'"))
-            }
-        );
+        self.remote_op(format!("Pulling {name}\u{2026}"), move |path| {
+            gitkraft_core::features::branches::pull_rebase(path, "origin")
+                .map_err(|e| format!("pull: {e}"))?;
+            Ok(format!("Pulled '{name}'"))
+        });
     }
 
     // ── Stash ────────────────────────────────────────────────────────────
@@ -1981,115 +1990,88 @@ impl App {
 
     // ── Remote ───────────────────────────────────────────────────────────
 
-    pub fn fetch_remote(&mut self) {
-        let repo_path = match self.tab().repo_path.clone() {
-            Some(p) => p,
-            None => return,
+    /// Run a fetch, pull or push for the active tab on a background thread;
+    /// `op` gets the workdir and returns the status to show or the error.
+    /// One at a time per tab, and the result goes to the tab it started in
+    /// even if the user switched tabs meanwhile.
+    fn remote_op(
+        &mut self,
+        status: String,
+        op: impl FnOnce(&std::path::Path) -> Result<String, String> + Send + 'static,
+    ) {
+        let Some(path) = self.tab().repo_path.clone() else {
+            return;
         };
-        self.tab_mut().is_loading = true;
-        self.tab_mut().status_message = Some("Fetching…".into());
+        let tab = self.tab_mut();
+        if tab.remote_busy {
+            tab.status_message = Some("Wait for the running fetch, pull or push to finish".into());
+            return;
+        }
+        tab.remote_busy = true;
+        tab.is_loading = true;
+        tab.status_message = Some(status);
         let tx = self.bg_tx.clone();
         std::thread::spawn(move || {
-            let res = (|| {
-                let repo = open_repo_str(&repo_path)?;
-                gitkraft_core::features::remotes::fetch_remote(&repo, "origin")
-                    .map_err(|e| e.to_string())
-            })();
-            let _ = tx.send(BackgroundResult::FetchDone(res));
+            let result = op(&path);
+            let _ = tx.send(BackgroundResult::RemoteOpDone { path, result });
+        });
+    }
+
+    pub fn fetch_remote(&mut self) {
+        self.remote_op("Fetching…".into(), |path| {
+            // System git, not libgit2: credential helpers and the SSH agent work.
+            gitkraft_core::features::branches::fetch_remote_cli(path, "origin")
+                .map_err(|e| format!("fetch: {e}"))?;
+            Ok("Fetched from origin".into())
         });
     }
 
     pub fn pull_rebase(&mut self) {
-        let repo_path = match self.tab().repo_path.clone() {
-            Some(p) => p,
-            None => return,
-        };
-        self.tab_mut().is_loading = true;
-        self.tab_mut().status_message = Some("Pulling (rebase)…".into());
-        let tx = self.bg_tx.clone();
-        std::thread::spawn(move || {
-            let workdir = std::path::Path::new(&repo_path);
-            let res = gitkraft_core::features::branches::pull_rebase(workdir, "origin");
-            let _ = tx.send(BackgroundResult::OperationDone {
-                ok_message: res
-                    .as_ref()
-                    .ok()
-                    .map(|_| "Pulled (rebase) from origin".into()),
-                err_message: res.err().map(|e| format!("pull: {e}")),
-                needs_refresh: true,
-                needs_staging_refresh: false,
-            });
+        self.remote_op("Pulling (rebase)…".into(), |path| {
+            gitkraft_core::features::branches::pull_rebase(path, "origin")
+                .map_err(|e| format!("pull: {e}"))?;
+            Ok("Pulled (rebase) from origin".into())
         });
     }
 
-    pub fn push_branch(&mut self) {
-        let repo_path = match self.tab().repo_path.clone() {
-            Some(p) => p,
-            None => return,
-        };
-        let branch = match self
+    /// The checked-out branch, or `None` after showing an error.
+    fn head_branch_or_error(&mut self) -> Option<String> {
+        let branch = self
             .tab()
             .repo_info
             .as_ref()
-            .and_then(|i| i.head_branch.clone())
-        {
-            Some(b) => b,
-            None => {
-                self.tab_mut().error_message = Some("No branch checked out".into());
-                return;
-            }
+            .and_then(|i| i.head_branch.clone());
+        if branch.is_none() {
+            self.tab_mut().error_message = Some("No branch checked out".into());
+        }
+        branch
+    }
+
+    pub fn push_branch(&mut self) {
+        if self.tab().repo_path.is_none() {
+            return;
+        }
+        let Some(branch) = self.head_branch_or_error() else {
+            return;
         };
-        self.tab_mut().is_loading = true;
-        self.tab_mut().status_message = Some(format!("Pushing {branch}…"));
-        let tx = self.bg_tx.clone();
-        std::thread::spawn(move || {
-            let workdir = std::path::Path::new(&repo_path);
-            let res = gitkraft_core::features::branches::push_branch(workdir, &branch, "origin");
-            let _ = tx.send(BackgroundResult::OperationDone {
-                ok_message: res
-                    .as_ref()
-                    .ok()
-                    .map(|_| format!("Pushed {branch} to origin")),
-                err_message: res.err().map(|e| format!("push: {e}")),
-                needs_refresh: true,
-                needs_staging_refresh: false,
-            });
+        self.remote_op(format!("Pushing {branch}…"), move |path| {
+            gitkraft_core::features::branches::push_branch(path, &branch, "origin")
+                .map_err(|e| format!("push: {e}"))?;
+            Ok(format!("Pushed {branch} to origin"))
         });
     }
 
     pub fn force_push_branch(&mut self) {
-        let repo_path = match self.tab().repo_path.clone() {
-            Some(p) => p,
-            None => return,
+        if self.tab().repo_path.is_none() {
+            return;
+        }
+        let Some(branch) = self.head_branch_or_error() else {
+            return;
         };
-        let branch = match self
-            .tab()
-            .repo_info
-            .as_ref()
-            .and_then(|i| i.head_branch.clone())
-        {
-            Some(b) => b,
-            None => {
-                self.tab_mut().error_message = Some("No branch checked out".into());
-                return;
-            }
-        };
-        self.tab_mut().is_loading = true;
-        self.tab_mut().status_message = Some(format!("Force pushing {branch}…"));
-        let tx = self.bg_tx.clone();
-        std::thread::spawn(move || {
-            let workdir = std::path::Path::new(&repo_path);
-            let res =
-                gitkraft_core::features::branches::force_push_branch(workdir, &branch, "origin");
-            let _ = tx.send(BackgroundResult::OperationDone {
-                ok_message: res
-                    .as_ref()
-                    .ok()
-                    .map(|_| format!("Force pushed {branch} to origin")),
-                err_message: res.err().map(|e| format!("force push: {e}")),
-                needs_refresh: true,
-                needs_staging_refresh: false,
-            });
+        self.remote_op(format!("Force pushing {branch}…"), move |path| {
+            gitkraft_core::features::branches::force_push_branch(path, &branch, "origin")
+                .map_err(|e| format!("force push: {e}"))?;
+            Ok(format!("Force pushed {branch} to origin"))
         });
     }
 
@@ -3929,13 +3911,40 @@ mod tests {
     }
 
     #[test]
-    fn bg_op_refresh_variant_triggers_full_refresh_on_success() {
-        // fetch_remote uses bg_op! with the refresh variant
-        // We can't run a real git fetch, but we can verify is_loading is set.
+    fn remote_ops_run_one_at_a_time() {
         let mut app = App::new();
-        app.tab_mut().repo_path = Some(std::path::PathBuf::from("/tmp/fake-repo"));
+        app.tab_mut().repo_path = Some(PathBuf::from("/tmp/fake-repo"));
         app.fetch_remote();
-        assert!(app.tab().is_loading);
+        assert!(app.tab().is_loading && app.tab().remote_busy);
+        app.pull_rebase();
+        assert_eq!(
+            app.tab().status_message.as_deref(),
+            Some("Wait for the running fetch, pull or push to finish")
+        );
+    }
+
+    #[test]
+    fn remote_op_result_goes_to_the_tab_it_started_in() {
+        let mut app = App::new();
+        let repo_a = PathBuf::from("/tmp/fake-repo-a");
+        app.tabs[0].repo_path = Some(repo_a.clone());
+        app.tabs[0].remote_busy = true;
+        app.tabs.push(RepoTab::new());
+        app.tabs[1].repo_path = Some(PathBuf::from("/tmp/fake-repo-b"));
+        // The user switched tabs while the push ran.
+        app.active_tab_index = 1;
+
+        app.bg_tx
+            .send(BackgroundResult::RemoteOpDone {
+                path: repo_a,
+                result: Err("push: rejected".into()),
+            })
+            .unwrap();
+        app.poll_background();
+
+        assert!(!app.tabs[0].remote_busy);
+        assert_eq!(app.tabs[0].error_message.as_deref(), Some("push: rejected"));
+        assert!(app.tabs[1].error_message.is_none() && !app.tabs[1].is_loading);
     }
 
     // ── Status bar mode indicator ─────────────────────────────────────────────

@@ -77,27 +77,34 @@ pub(crate) fn init_repo(path: PathBuf) -> Task<Message> {
 
 /// Refresh all data for an already-open repository, preserving scroll depth.
 pub(crate) fn refresh_repo(path: PathBuf, current_commit_count: usize) -> Task<Message> {
+    let target = path.clone();
     git_task!(
-        Message::RepoRefreshed,
+        move |result| Message::RepoRefreshed(target, result),
         gitkraft_core::load_repo_snapshot_with_depth(&path, current_commit_count).str_err()
     )
 }
 
 /// Background fetch, then reload the repo so ahead/behind counts update.
-/// Failures (offline, credentials needed) are dropped silently.
+/// Failures (offline, credentials needed) are not shown.
 pub(crate) fn auto_fetch(path: PathBuf, current_commit_count: usize) -> Task<Message> {
+    let target = path.clone();
     git_task!(
-        |result: Result<RepoPayload, String>| match result {
-            Ok(payload) => Message::RepoRefreshed(Ok(payload)),
-            // Offline or credentials needed: try again next time.
-            Err(_) => Message::Noop,
-        },
+        move |result| Message::AutoFetchDone(target, result),
         (|| {
             let wd = workdir(&path)?;
             gitkraft_core::features::branches::fetch_all_quiet(&wd).str_err()?;
             gitkraft_core::load_repo_snapshot_with_depth(&path, current_commit_count).str_err()
         })()
     )
+}
+
+/// Maps the reloaded repo after an operation on `path` to
+/// [`Message::GitOperationResult`], for the tab showing that repo.
+pub(crate) fn reloaded(
+    path: &std::path::Path,
+) -> impl FnOnce(Result<RepoPayload, String>) -> Message + Send + 'static {
+    let path = path.to_path_buf();
+    move |result| Message::GitOperationResult(path, result)
 }
 
 /// Blocking helper shared by `load_repo` and `refresh_repo`.
@@ -121,9 +128,10 @@ pub(crate) fn workdir(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
 
 /// Push `branch` to `remote` then reload the repo.
 pub(crate) fn push_branch_async(path: PathBuf, branch: String, remote: String) -> Task<Message> {
-    git_wd_then_reload!(path, |wd| gitkraft_core::features::branches::push_branch(
-        &wd, &branch, &remote
-    ))
+    let done = format!("Pushed '{branch}' to {remote}.");
+    remote_op_then_reload!(path, done, |wd| {
+        gitkraft_core::features::branches::push_branch(&wd, &branch, &remote)
+    })
 }
 
 /// Force-push `branch` to `remote` (with --force-with-lease) then reload.
@@ -132,16 +140,18 @@ pub(crate) fn force_push_branch_async(
     branch: String,
     remote: String,
 ) -> Task<Message> {
-    git_wd_then_reload!(path, |wd| {
+    let done = format!("Force pushed '{branch}' to {remote}.");
+    remote_op_then_reload!(path, done, |wd| {
         gitkraft_core::features::branches::force_push_branch(&wd, &branch, &remote)
     })
 }
 
 /// `git pull` with merge (or the configured `pull.rebase`) then reload.
-pub(crate) fn pull_merge_async(path: PathBuf) -> Task<Message> {
-    git_wd_then_reload!(path, |wd| gitkraft_core::features::branches::pull_merge(
-        &wd
-    ))
+pub(crate) fn pull_merge_async(path: PathBuf, remote: String) -> Task<Message> {
+    let done = format!("Pulled from {remote}.");
+    remote_op_then_reload!(path, done, |wd| {
+        gitkraft_core::features::branches::pull_merge(&wd)
+    })
 }
 
 /// Merge `refname` (a remote branch) into the current branch then reload.
@@ -153,9 +163,10 @@ pub(crate) fn merge_ref_async(path: PathBuf, refname: String) -> Task<Message> {
 
 /// Pull the current branch from `remote` with `--rebase` then reload.
 pub(crate) fn pull_rebase_async(path: PathBuf, remote: String) -> Task<Message> {
-    git_wd_then_reload!(path, |wd| gitkraft_core::features::branches::pull_rebase(
-        &wd, &remote
-    ))
+    let done = format!("Pulled from {remote} (rebase).");
+    remote_op_then_reload!(path, done, |wd| {
+        gitkraft_core::features::branches::pull_rebase(&wd, &remote)
+    })
 }
 
 /// Rebase current HEAD onto `target` (branch name or OID) then reload.
@@ -211,7 +222,8 @@ pub(crate) fn merge_branch_async(path: PathBuf, branch_name: String) -> Task<Mes
 
 /// Delete a remote branch using `git push --delete`.
 pub(crate) fn delete_remote_branch_async(path: PathBuf, full_name: String) -> Task<Message> {
-    git_wd_then_reload!(path, |wd| {
+    let done = format!("Deleted remote branch '{full_name}'.");
+    remote_op_then_reload!(path, done, |wd| {
         gitkraft_core::features::branches::delete_remote_branch(&wd, &full_name)
     })
 }
@@ -300,8 +312,9 @@ pub(crate) fn execute_commit_action_async(
 
 /// Cherry-pick a list of commits (by OID) onto the current branch then reload.
 pub(crate) fn cherry_pick_commits_async(path: PathBuf, oids: Vec<String>) -> Task<Message> {
+    let on_done = reloaded(&path);
     git_task!(
-        Message::GitOperationResult,
+        on_done,
         (|| {
             let wd = workdir(&path)?;
             for oid in &oids {
@@ -314,8 +327,9 @@ pub(crate) fn cherry_pick_commits_async(path: PathBuf, oids: Vec<String>) -> Tas
 
 /// Revert a list of commits (by OID) in order then reload.
 pub(crate) fn revert_commits_async(path: PathBuf, oids: Vec<String>) -> Task<Message> {
+    let on_done = reloaded(&path);
     git_task!(
-        Message::GitOperationResult,
+        on_done,
         (|| {
             let wd = workdir(&path)?;
             for oid in &oids {

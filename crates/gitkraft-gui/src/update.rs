@@ -17,6 +17,13 @@ impl GitKraft {
     /// whenever a [`Message`] is produced (by user interaction or an async
     /// task completing).
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        // Whatever selected a diff, start loading its images if it is one.
+        let preview = self.ensure_image_preview();
+        Task::batch([task, preview])
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match &message {
             // ── Tabs ──────────────────────────────────────────────────────
             Message::SwitchTab(index) => {
@@ -101,7 +108,13 @@ impl GitKraft {
 
             Message::CommitMessageChanged(_)
             | Message::CreateCommit
-            | Message::CommitCreated(_) => crate::features::commits::update::update(self, message),
+            | Message::CommitCreated(_)
+            | Message::CommitDescriptionAction(_)
+            | Message::GenerateCommitMessage
+            | Message::CommitMessageGenerated(_, _)
+            | Message::TogglePushAfterCommit(_) => {
+                crate::features::commits::update::update(self, message)
+            }
 
             Message::CommitLogScrolled(abs_y, rel_y) => {
                 // Store the scroll offset so the view can virtualise rows.
@@ -139,6 +152,7 @@ impl GitKraft {
             | Message::StageAll
             | Message::UnstageAll
             | Message::DiscardFile(_)
+            | Message::AskDiscard(_)
             | Message::ConfirmDiscard(_)
             | Message::CancelDiscard
             | Message::StagingUpdated(_)
@@ -171,9 +185,9 @@ impl GitKraft {
             Message::LoadStagingFileDiff(_, _)
             | Message::StagingFileDiffLoaded(_)
             | Message::SelectDiffByIndex(_)
-            | Message::CommitMultiDiffLoaded(_) => {
-                crate::features::diff::update::update(self, message)
-            }
+            | Message::CommitMultiDiffLoaded(_)
+            | Message::ImagePreviewLoaded(_)
+            | Message::ToggleSvgText => crate::features::diff::update::update(self, message),
 
             Message::ModifiersChanged(mods) => {
                 self.keyboard_modifiers = *mods;
@@ -742,6 +756,26 @@ impl GitKraft {
                 )
             }
 
+            Message::PullMerge => {
+                let remote = self.active_tab().default_remote();
+                self.dismiss_menu();
+                with_repo!(self, loading, format!("Pulling from {remote}…"), |path| {
+                    crate::features::repo::commands::pull_merge_async(path)
+                })
+            }
+
+            Message::MergeRemoteBranch(name) => {
+                let name = name.clone();
+                self.dismiss_menu();
+                self.branch_popup_open = false;
+                with_repo!(
+                    self,
+                    loading,
+                    format!("Merging '{name}' into current branch…"),
+                    |path| crate::features::repo::commands::merge_ref_async(path, name)
+                )
+            }
+
             Message::RebaseOnto(target) => {
                 let target = target.clone();
                 self.dismiss_menu();
@@ -983,7 +1017,32 @@ impl GitKraft {
             Message::ThemeSaved(_)
             | Message::EditorSaved(_)
             | Message::LayoutSaved(_)
-            | Message::SessionSaved(_) => Task::none(),
+            | Message::SessionSaved(_)
+            | Message::PushAfterCommitSaved(_)
+            | Message::LayoutStyleSaved(_) => Task::none(),
+
+            Message::AutoFetchTick => {
+                // Like GitHub Desktop: keep remote-tracking refs fresh so the
+                // tabs can show what there is to pull.
+                let tasks: Vec<Task<Message>> = self
+                    .tabs
+                    .iter()
+                    .filter(|t| !t.remotes.is_empty() && !t.is_loading)
+                    .filter_map(|t| {
+                        t.repo_path.clone().map(|p| {
+                            crate::features::repo::commands::auto_fetch(p, t.commits.len())
+                        })
+                    })
+                    .collect();
+                Task::batch(tasks)
+            }
+
+            Message::ToggleLayoutStyle
+            | Message::SetGhdTab(_)
+            | Message::ToggleBranchPopup
+            | Message::CloseBranchPopup => {
+                crate::features::github_layout::update::update(self, message)
+            }
 
             Message::EditorChanged(editor) => {
                 self.editor = editor.clone();
@@ -1453,7 +1512,11 @@ impl GitKraft {
             }
 
             Message::CloseFileBlame => {
+                // Escape also closes the branch dropdown and pending confirmations.
+                self.branch_popup_open = false;
                 let tab = self.active_tab_mut();
+                tab.pending_discard = None;
+                tab.pending_delete_file = None;
                 tab.blame_path = None;
                 tab.blame_lines = Vec::new();
                 tab.blame_scroll = 0.0;

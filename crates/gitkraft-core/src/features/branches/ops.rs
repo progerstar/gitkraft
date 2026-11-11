@@ -324,6 +324,68 @@ pub fn pull_rebase(workdir: &std::path::Path, remote: &str) -> Result<()> {
     run_git(workdir, &["pull", "--rebase", remote])
 }
 
+/// Background `git fetch --all --prune` that never asks for credentials:
+/// without a credential helper or SSH agent it simply fails.
+pub fn fetch_all_quiet(workdir: &std::path::Path) -> Result<()> {
+    run_git_no_prompt(workdir, &["fetch", "--all", "--prune", "--quiet"])
+}
+
+/// `git fetch <remote>` with the system git, so credential helpers (e.g.
+/// `gh auth git-credential`) and the SSH agent work — unlike libgit2's fetch.
+/// Never prompts: there is no terminal to answer in.
+pub fn fetch_remote_cli(workdir: &std::path::Path, remote: &str) -> Result<()> {
+    run_git_no_prompt(workdir, &["fetch", "--prune", remote])
+}
+
+/// Pull the current branch from its upstream like GitHub Desktop: merge the
+/// remote changes in (a merge commit when histories diverged), unless the
+/// user's git config sets `pull.rebase`, which is then followed.
+pub fn pull_merge(workdir: &std::path::Path) -> Result<()> {
+    let rebase_configured = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["config", "--get", "pull.rebase"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if rebase_configured {
+        run_git_no_prompt(workdir, &["pull"])
+    } else {
+        run_git_no_prompt(workdir, &["pull", "--no-rebase"])
+    }
+}
+
+/// Merge `refname` (e.g. a remote branch like `origin/main`) into the current
+/// branch with the system git; the default merge message is used.
+pub fn merge_ref_cli(workdir: &std::path::Path, refname: &str) -> Result<()> {
+    run_git_no_prompt(workdir, &["merge", "--no-edit", refname])
+}
+
+/// Run git without any interaction: no credential prompts, no editor for
+/// merge messages. On failure the error carries git's output (conflict
+/// notices go to stdout, the rest to stderr).
+fn run_git_no_prompt(workdir: &std::path::Path, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("GIT_MERGE_AUTOEDIT", "no")
+        .env("GIT_EDITOR", "true")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("failed to spawn git")?;
+    if !output.status.success() {
+        let text = [output.stdout.as_slice(), output.stderr.as_slice()]
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("{text}");
+    }
+    Ok(())
+}
+
 /// Rebase the current HEAD onto `target` (branch name or OID).
 pub fn rebase_onto(workdir: &std::path::Path, target: &str) -> Result<()> {
     run_git(workdir, &["rebase", target])
@@ -532,5 +594,132 @@ mod tests {
         // Merging a branch that points at the same commit should be a no-op
         let result = merge_branch(&repo, "same");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fetch_all_quiet_updates_behind_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        let root = tmp.path();
+        git(root, &["init", "-q", "--bare", "origin.git"]);
+        git(root, &["clone", "-q", "origin.git", "me"]);
+        git(root, &["clone", "-q", "origin.git", "other"]);
+        let (me, other) = (root.join("me"), root.join("other"));
+        std::fs::write(me.join("a.txt"), "1").unwrap();
+        git(&me, &["add", "."]);
+        git(&me, &["commit", "-qm", "one"]);
+        git(&me, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        git(&other, &["pull", "-q", "origin", "main"]);
+        std::fs::write(other.join("b.txt"), "2").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "two"]);
+        git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        fetch_remote_cli(&me, "origin").unwrap();
+        // A real git error comes back as the message.
+        let err = fetch_remote_cli(&me, "nope").unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+        fetch_all_quiet(&me).unwrap();
+
+        let repo = Repository::open(&me).unwrap();
+        let branches = list_branches(&repo).unwrap();
+        let head = branches.iter().find(|b| b.is_head).unwrap();
+        assert_eq!(head.upstream_behind, Some(1));
+        assert_eq!(head.upstream_ahead, Some(0));
+    }
+
+    /// `origin.git` with a `me` clone that is 1 ahead and 1 behind.
+    fn diverged_clone(root: &std::path::Path, conflict: bool) -> std::path::PathBuf {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(root, &["init", "-q", "--bare", "origin.git"]);
+        git(root, &["clone", "-q", "origin.git", "me"]);
+        let me = root.join("me");
+        std::fs::write(me.join("a.txt"), "base\n").unwrap();
+        git(&me, &["add", "."]);
+        git(&me, &["commit", "-qm", "base"]);
+        git(&me, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        git(root, &["clone", "-q", "-b", "main", "origin.git", "other"]);
+        let other = root.join("other");
+        let theirs = if conflict { "a.txt" } else { "b.txt" };
+        std::fs::write(other.join(theirs), "theirs\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "theirs"]);
+        git(&other, &["push", "-q", "origin", "HEAD:main"]);
+        std::fs::write(me.join("a.txt"), "mine\n").unwrap();
+        git(&me, &["commit", "-qam", "mine"]);
+        // Identity for the merge commits the tests create.
+        git(&me, &["config", "user.name", "T"]);
+        git(&me, &["config", "user.email", "t@t"]);
+        me
+    }
+
+    #[test]
+    fn pull_merge_creates_a_merge_commit_on_diverged_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = diverged_clone(tmp.path(), false);
+        pull_merge(&me).unwrap();
+        let repo = Repository::open(&me).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 2, "expected a merge commit");
+        assert!(me.join("b.txt").exists());
+        let branches = list_branches(&repo).unwrap();
+        let main = branches.iter().find(|b| b.is_head).unwrap();
+        assert_eq!(main.upstream_behind, Some(0));
+    }
+
+    #[test]
+    fn merge_ref_cli_merges_a_remote_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = diverged_clone(tmp.path(), false);
+        fetch_remote_cli(&me, "origin").unwrap();
+        merge_ref_cli(&me, "origin/main").unwrap();
+        assert!(me.join("b.txt").exists());
+    }
+
+    #[test]
+    fn pull_merge_reports_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = diverged_clone(tmp.path(), true);
+        let err = pull_merge(&me).unwrap_err().to_string();
+        // git's own text (localised) names the conflicting file.
+        assert!(err.contains("a.txt"), "{err}");
+        let repo = Repository::open(&me).unwrap();
+        assert!(repo.index().unwrap().has_conflicts());
     }
 }

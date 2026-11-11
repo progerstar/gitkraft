@@ -18,8 +18,9 @@ pub(crate) fn fetch_remote(path: PathBuf, remote_name: String) -> Task<Message> 
     git_task!(
         Message::FetchCompleted,
         (|| {
-            let repo = open_repo!(&path);
-            gitkraft_core::features::remotes::fetch_remote(&repo, &remote_name).str_err()
+            // System git, not libgit2: respects credential helpers and the SSH agent.
+            let wd = crate::features::repo::commands::workdir(&path)?;
+            gitkraft_core::features::branches::fetch_remote_cli(&wd, &remote_name).str_err()
         })()
     )
 }

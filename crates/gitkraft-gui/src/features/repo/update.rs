@@ -12,6 +12,7 @@ use super::commands;
 pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
     match message {
         Message::OpenRepo => {
+            let start = picker_start_dir(state);
             // If the active tab already has a repo open, create a new tab
             // so the user doesn't lose their current work.
             if state.active_tab().has_repo() {
@@ -21,14 +22,15 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             let tab = state.active_tab_mut();
             tab.is_loading = true;
             tab.status_message = Some("Opening folder picker…".into());
-            commands::pick_folder_open()
+            commands::pick_folder_open(start)
         }
 
         Message::InitRepo => {
+            let start = picker_start_dir(state);
             let tab = state.active_tab_mut();
             tab.is_loading = true;
             tab.status_message = Some("Opening folder picker for init…".into());
-            commands::pick_folder_init()
+            commands::pick_folder_init(start)
         }
 
         Message::RepoSelected(maybe_path) => {
@@ -360,6 +362,19 @@ fn compute_branch_context(
     }
 
     result
+}
+
+/// Where the folder picker starts: next to the open repo, else next to the
+/// most recent one. `None` lets the picker fall back to the home folder.
+fn picker_start_dir(state: &GitKraft) -> Option<std::path::PathBuf> {
+    state
+        .active_tab()
+        .repo_path
+        .as_deref()
+        .or_else(|| state.recent_repos.first().map(|r| r.path.as_path()))
+        .and_then(|p| p.parent())
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_path_buf())
 }
 
 #[cfg(test)]

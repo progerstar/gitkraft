@@ -24,6 +24,7 @@ gitkraft-core = { workspace = true }
 tui-spinner   = { workspace = true }
 iced       = { workspace = true }
 iced_fonts = { workspace = true }
+image      = { workspace = true }
 rfd        = { workspace = true }
 futures       = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

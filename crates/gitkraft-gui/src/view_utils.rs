@@ -259,6 +259,18 @@ pub fn shift_click_range(anchor: Option<usize>, clicked: usize) -> Vec<usize> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Trash-button action for a changed file, always confirmed first: a tracked
+/// file has its working-tree changes discarded; an untracked file can only be
+/// deleted (discarding would leave it untouched).
+pub(crate) fn discard_or_delete(entry: &gitkraft_core::DiffFileEntry) -> crate::message::Message {
+    let path = entry.display_path().to_string();
+    if entry.status == gitkraft_core::FileStatus::Untracked {
+        crate::message::Message::DeleteFile(path)
+    } else {
+        crate::message::Message::AskDiscard(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::truncate_to_fit;

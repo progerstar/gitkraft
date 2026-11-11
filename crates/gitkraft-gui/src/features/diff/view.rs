@@ -9,10 +9,11 @@
 //! (or near) the visible viewport are materialised as widgets, keeping the
 //! widget tree small even for multi-thousand-line diffs.
 
-use gitkraft_core::{DiffInfo, DiffLine};
+use gitkraft_core::{DiffInfo, DiffLine, ImageKind};
 use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Alignment, Element, Font, Length};
 
+use super::image_view;
 use crate::icons;
 use crate::message::Message;
 use crate::state::GitKraft;
@@ -119,7 +120,7 @@ pub(crate) fn view(state: &GitKraft) -> Element<'_, Message> {
                     crate::state::DragTarget::DiffFileListRight,
                     &c,
                 );
-                let diff_panel = diff_content(diff, &c, tab.diff_scroll_offset);
+                let diff_panel = diff_panel(state, diff, &c);
 
                 let layout = row![file_list, divider, diff_panel]
                     .width(Length::Fill)
@@ -132,7 +133,7 @@ pub(crate) fn view(state: &GitKraft) -> Element<'_, Message> {
                     .into()
             } else {
                 // Single file (or staging diff) — show diff only.
-                container(diff_content(diff, &c, tab.diff_scroll_offset))
+                container(diff_panel(state, diff, &c))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(theme::surface_style)
@@ -457,16 +458,62 @@ fn loading_diff_view<'a>(c: &ThemeColors, animation_tick: u64) -> Element<'a, Me
         .into()
 }
 
-/// Render the full diff content for a single [`DiffInfo`] with virtual
-/// scrolling. Only lines within (or near) the visible viewport are
-/// materialised as widgets.
-fn diff_content<'a>(
+/// Text diff, or before/after images when the file is an image.
+fn diff_panel<'a>(
+    state: &'a GitKraft,
     diff: &'a DiffInfo,
     c: &ThemeColors,
-    scroll_offset: f32,
 ) -> Element<'a, Message> {
-    let file_path_display = diff.display_path().to_string();
+    let tab = state.active_tab();
+    let Some(kind) = gitkraft_core::image_kind(diff.display_path()) else {
+        return diff_content(diff, c, tab.diff_scroll_offset, None);
+    };
 
+    // SVG is text too: offer a switch between the picture and the text diff.
+    let is_svg = kind == ImageKind::Svg;
+    let toggle: Option<Element<'a, Message>> = is_svg.then(|| {
+        let (glyph, label) = if state.svg_as_text {
+            (icons::IMAGE, "Show image")
+        } else {
+            (icons::FILE_CODE, "Show text")
+        };
+        button(
+            row![
+                icon!(glyph, 12, c.accent),
+                Space::new().width(4),
+                text(label).size(11)
+            ]
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 8])
+        .style(theme::toolbar_button)
+        .on_press(Message::ToggleSvgText)
+        .into()
+    });
+    if is_svg && state.svg_as_text {
+        return diff_content(diff, c, tab.diff_scroll_offset, toggle);
+    }
+
+    let key = image_view::image_key(diff);
+    let preview = tab
+        .image_preview
+        .as_ref()
+        .filter(|p| key.as_deref() == Some(p.key.as_str()));
+    column![
+        file_header(diff, c, toggle),
+        image_view::view(preview, &diff.status, c)
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// Status badge + path, with an optional control on the right.
+fn file_header<'a>(
+    diff: &DiffInfo,
+    c: &ThemeColors,
+    extra: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
     let status_color = theme::status_color(&diff.status, c);
 
     let status_badge = text(format!(" {} ", diff.status))
@@ -474,17 +521,36 @@ fn diff_content<'a>(
         .color(status_color)
         .font(Font::MONOSPACE);
 
-    let file_label = text(file_path_display)
+    let file_label = text(diff.display_path().to_string())
         .size(14)
         .color(c.text_primary)
         .font(Font::MONOSPACE);
 
-    let file_header = container(
-        row![status_badge, Space::new().width(8), file_label].align_y(iced::Alignment::Center),
-    )
-    .padding([8, 12])
-    .width(Length::Fill)
-    .style(theme::header_style);
+    let mut header_row =
+        row![status_badge, Space::new().width(8), file_label].align_y(iced::Alignment::Center);
+    if let Some(extra) = extra {
+        header_row = header_row
+            .push(Space::new().width(Length::Fill))
+            .push(extra);
+    }
+
+    container(header_row)
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(theme::header_style)
+        .into()
+}
+
+/// Render the full diff content for a single [`DiffInfo`] with virtual
+/// scrolling. Only lines within (or near) the visible viewport are
+/// materialised as widgets.
+fn diff_content<'a>(
+    diff: &'a DiffInfo,
+    c: &ThemeColors,
+    scroll_offset: f32,
+    header_extra: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let file_header = file_header(diff, c, header_extra);
 
     let mut lines_col = column![].width(Length::Fill);
 

@@ -12,6 +12,7 @@ use super::commands;
 pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
     match message {
         Message::CheckoutBranch(name) => {
+            state.branch_popup_open = false;
             with_repo!(
                 state,
                 dismiss,

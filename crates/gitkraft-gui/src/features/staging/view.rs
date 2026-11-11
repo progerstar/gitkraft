@@ -3,7 +3,8 @@
 //! layout.
 
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+    Space, button, checkbox, column, container, mouse_area, row, scrollable, text, text_editor,
+    text_input, tooltip,
 };
 use iced::{Alignment, Element, Font, Length};
 
@@ -209,7 +210,7 @@ fn staging_file_list_view(state: &GitKraft, kind: StagingKind) -> Element<'_, Me
                 let discard_btn = button(icon!(icons::TRASH, 11, c.red))
                     .padding([2, 4])
                     .style(theme::icon_button)
-                    .on_press(Message::DiscardFile(file_path_display.to_string()));
+                    .on_press(crate::view_utils::discard_or_delete(diff));
                 file_row = file_row
                     .push(Space::new().width(2))
                     .push(stage_btn)
@@ -278,7 +279,7 @@ fn staging_file_list_view(state: &GitKraft, kind: StagingKind) -> Element<'_, Me
 }
 
 /// Render the commit message input and "Commit" button.
-fn commit_view(state: &GitKraft) -> Element<'_, Message> {
+pub(crate) fn commit_view(state: &GitKraft) -> Element<'_, Message> {
     let tab = state.active_tab();
     let c = state.colors();
 
@@ -290,11 +291,63 @@ fn commit_view(state: &GitKraft) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .padding([6, 8]);
 
-    let input = text_input("Commit message\u{2026}", &tab.commit_message)
+    let input = text_input("Summary\u{2026}", &tab.commit_message)
         .id(iced::widget::Id::new("commit_message_input"))
         .on_input(Message::CommitMessageChanged)
         .padding(8)
         .size(13);
+
+    // ✨ — ask the configured AI agent for a message based on the staged diff.
+    let can_generate = !tab.staged_changes.is_empty() && !tab.generating_commit_message;
+    let ai_label: Element<'_, Message> = if tab.generating_commit_message {
+        let frames = tui_spinner::FluxFrames::CORNERS;
+        text(frames[state.animation_tick as usize % frames.len()].to_string())
+            .size(14)
+            .font(Font::MONOSPACE)
+            .color(c.accent)
+            .into()
+    } else {
+        icon!(
+            icons::STARS,
+            14,
+            if can_generate { c.accent } else { c.muted }
+        )
+        .into()
+    };
+    let ai_btn = tooltip(
+        view_utils::on_press_maybe(
+            button(ai_label)
+                .padding([8, 10])
+                .style(theme::toolbar_button),
+            can_generate.then_some(Message::GenerateCommitMessage),
+        ),
+        container(
+            text(if tab.generating_commit_message {
+                "Generating commit message\u{2026}"
+            } else {
+                "Generate summary and description from the staged diff"
+            })
+            .size(11),
+        )
+        .padding([4, 8])
+        .style(theme::header_style),
+        tooltip::Position::Top,
+    );
+    let summary_row = row![input, Space::new().width(4), ai_btn].align_y(Alignment::Center);
+
+    let description = text_editor(&tab.commit_description)
+        .placeholder("Description")
+        .on_action(Message::CommitDescriptionAction)
+        .padding(8)
+        .size(13)
+        .height(Length::Fill)
+        .min_height(48);
+
+    let pull_toggle = checkbox(state.push_after_commit)
+        .label("Push after commit")
+        .on_toggle(Message::TogglePushAfterCommit)
+        .size(14)
+        .text_size(12);
 
     // First-line length hint
     let (first_line_len, severity) = gitkraft_core::check_commit_message(&tab.commit_message);
@@ -323,8 +376,16 @@ fn commit_view(state: &GitKraft) -> Element<'_, Message> {
         if can_commit { c.green } else { c.muted }
     );
 
-    let commit_btn_content = row![commit_icon, Space::new().width(6), text("Commit").size(13),]
-        .align_y(Alignment::Center);
+    let commit_label = match tab.current_branch.as_deref() {
+        Some(branch) => format!("Commit to {branch}"),
+        None => "Commit".to_string(),
+    };
+    let commit_btn_content = row![
+        commit_icon,
+        Space::new().width(6),
+        text(commit_label).size(13),
+    ]
+    .align_y(Alignment::Center);
 
     let commit_msg = can_commit.then_some(Message::CreateCommit);
     let commit_btn = view_utils::on_press_maybe(
@@ -349,16 +410,21 @@ fn commit_view(state: &GitKraft) -> Element<'_, Message> {
         header_row,
         container(
             column![
-                input,
+                summary_row,
                 char_hint,
-                Space::new().height(4),
+                description,
+                Space::new().height(2),
+                pull_toggle,
+                Space::new().height(2),
                 commit_btn,
                 Space::new().height(4),
                 staged_hint,
             ]
             .spacing(2)
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
+        .height(Length::Fill)
         .padding([4, 8]),
     ]
     .width(Length::Fill)

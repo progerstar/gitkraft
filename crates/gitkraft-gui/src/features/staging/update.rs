@@ -91,6 +91,11 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             )
         }
 
+        Message::AskDiscard(path) => {
+            state.active_tab_mut().pending_discard = Some(path);
+            Task::none()
+        }
+
         Message::ConfirmDiscard(path) => {
             with_repo!(
                 state,

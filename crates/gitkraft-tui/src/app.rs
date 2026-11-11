@@ -2702,9 +2702,8 @@ mod tests {
 
     #[test]
     fn theme_name_to_index_known() {
-        assert_eq!(gitkraft_core::theme_index_by_name("Default"), 0);
-        assert_eq!(gitkraft_core::theme_index_by_name("Dracula"), 9);
-        assert_eq!(gitkraft_core::theme_index_by_name("Nord"), 10);
+        assert_eq!(gitkraft_core::theme_index_by_name("Ember"), 0);
+        assert_eq!(gitkraft_core::theme_index_by_name("Desk Dark"), 2);
     }
 
     #[test]
@@ -3040,6 +3039,8 @@ mod tests {
                 new_file: "a.rs".to_string(),
                 status: gitkraft_core::FileStatus::Modified,
                 hunks: Vec::new(),
+                old_id: None,
+                new_id: None,
             },
         );
         // without repo_path the bg task would be a no-op anyway, but is_loading
@@ -3326,7 +3327,9 @@ mod tests {
             status: gitkraft_core::FileStatus::Modified,
         }];
         app.tab_mut().commit_diff_file_index = 0;
-        // editor is Editor::None by default
+        // App::new() reads the user's real settings: force "no editor" so the
+        // test never launches a real one.
+        app.editor = gitkraft_core::Editor::None;
 
         app.open_commit_files_in_editor();
 
@@ -4598,6 +4601,8 @@ mod tests {
             new_file: new_file.to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: Vec::new(),
+            old_id: None,
+            new_id: None,
         }
     }
 

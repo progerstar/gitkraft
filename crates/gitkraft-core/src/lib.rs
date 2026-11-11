@@ -19,10 +19,11 @@ pub use features::branches::{BranchInfo, BranchType, validate_ref_name};
 pub use features::commits::CommitInfo;
 pub use features::commits::{COMMIT_MENU_GROUPS, CommitAction, CommitActionKind};
 pub use features::commits::{COMMIT_SUBJECT_LIMIT, CommitMsgSeverity, check_commit_message};
+pub use features::commits::{DEFAULT_COMMIT_MESSAGE_COMMAND, split_commit_message};
 pub use features::commits::{RefKind, RefLabel};
 pub use features::diff::{
-    BlameLine, DiffFileEntry, DiffHunk, DiffInfo, DiffLine, FileStatus, StatusColorCategory,
-    blame_file,
+    BlameLine, DiffFileEntry, DiffHunk, DiffInfo, DiffLine, FileStatus, ImageDiff, ImageKind,
+    StatusColorCategory, blame_file, image_kind,
 };
 pub use features::editor::{EDITOR_NAMES, Editor, open_file_default, show_in_folder};
 pub use features::graph::{GraphEdge, GraphRow};

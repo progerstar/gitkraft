@@ -168,6 +168,34 @@ pub(crate) fn create_commit(path: PathBuf, message: String) -> Task<Message> {
     )
 }
 
+/// Ask the configured agent command for a commit message for the staged diff.
+pub(crate) fn generate_commit_message(path: PathBuf) -> Task<Message> {
+    let reply_path = path.clone();
+    git_task!(
+        move |result| Message::CommitMessageGenerated(reply_path.clone(), result),
+        (|| {
+            let repo = open_repo!(&path);
+            let patch = gitkraft_core::features::commits::staged_patch(&repo).str_err()?;
+            let workdir = repo.workdir().ok_or("bare repository")?.to_path_buf();
+            let command = gitkraft_core::features::persistence::load_settings()
+                .ok()
+                .and_then(|s| s.commit_message_command)
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| gitkraft_core::DEFAULT_COMMIT_MESSAGE_COMMAND.to_string());
+            gitkraft_core::features::commits::generate_commit_message(&workdir, &command, &patch)
+                .str_err()
+        })()
+    )
+}
+
+/// Persist the "Push after commit" checkbox.
+pub(crate) fn save_push_after_commit(enabled: bool) -> Task<Message> {
+    git_task!(
+        Message::PushAfterCommitSaved,
+        gitkraft_core::features::persistence::save_push_after_commit(enabled).str_err()
+    )
+}
+
 /// Restore a single file from a commit to the working directory.
 pub(crate) fn checkout_file_at_commit(
     path: PathBuf,

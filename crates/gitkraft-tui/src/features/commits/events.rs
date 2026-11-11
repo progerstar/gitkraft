@@ -657,6 +657,8 @@ mod tests {
             new_file: "a.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
         app.tab_mut().commit_list_state.select(Some(0));
         navigate_down(&mut app);

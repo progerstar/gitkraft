@@ -31,6 +31,18 @@ pub const TRASH: char = '\u{f5de}';
 pub const INBOX: char = '\u{f40c}';
 pub const CLOUD_UPLOAD: char = '\u{f2c0}';
 pub const BOX_ARROW_UP: char = '\u{f1c6}';
+pub const STARS: char = '\u{f589}';
+pub const IMAGE: char = '\u{f42a}';
+pub const FILE_CODE: char = '\u{f352}';
+pub const CHECK_SQUARE_FILL: char = '\u{f26c}';
+pub const DASH_SQUARE_FILL: char = '\u{f2e8}';
+pub const SQUARE: char = '\u{f584}';
+pub const CARET_DOWN_FILL: char = '\u{f229}';
+pub const LAYOUT_SIDEBAR: char = '\u{f45f}';
+pub const LAYOUT_THREE_COLUMNS: char = '\u{f465}';
+pub const ARROW_UP_SHORT: char = '\u{f145}';
+pub const ARROW_DOWN_SHORT: char = '\u{f124}';
+pub const CLIPBOARD: char = '\u{f290}';
 
 // -- Panels / sections -----------------------------------------------------
 pub const CLOUD: char = '\u{f2c1}';

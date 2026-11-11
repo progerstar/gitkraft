@@ -135,6 +135,16 @@ pub fn save_editor(editor_name: &str) -> Result<()> {
     update_settings(|s| s.editor_name = Some(editor_name.to_string()))
 }
 
+/// Persist the "pull after commit" checkbox.
+pub fn save_push_after_commit(enabled: bool) -> Result<()> {
+    update_settings(|s| s.push_after_commit = enabled)
+}
+
+/// Persist the GUI layout style (`"classic"` / `"two-pane"`).
+pub fn save_layout_style(style: &str) -> Result<()> {
+    update_settings(|s| s.layout_style = Some(style.to_string()))
+}
+
 /// Return the saved editor name, if any.
 pub fn get_saved_editor() -> Result<Option<String>> {
     Ok(load_settings()?.editor_name)

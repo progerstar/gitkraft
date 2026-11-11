@@ -220,6 +220,15 @@ pub fn header_style(theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// Solid accent-coloured bar (active tab underline).
+pub fn accent_bar_style(theme: &iced::Theme) -> container::Style {
+    let c = ThemeColors::from_theme(theme);
+    container::Style {
+        background: Some(Background::Color(c.accent)),
+        ..Default::default()
+    }
+}
+
 /// Style for the floating context-menu panel.
 pub fn context_menu_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
@@ -653,7 +662,7 @@ mod tests {
 
     #[test]
     fn from_core_dark_theme() {
-        let core = gitkraft_core::theme_by_index(0); // Default (dark)
+        let core = gitkraft_core::theme_by_index(0); // Ember (dark)
         let colors = ThemeColors::from_core(&core);
         // Dark theme should have a dark background
         assert!(colors.bg.r < 0.5);
@@ -665,8 +674,7 @@ mod tests {
 
     #[test]
     fn from_core_light_theme() {
-        let core =
-            gitkraft_core::theme_by_index(gitkraft_core::theme_index_by_name("Solarized Light")); // Solarized Light
+        let core = gitkraft_core::theme_by_index(gitkraft_core::theme_index_by_name("Desk Light"));
         let colors = ThemeColors::from_core(&core);
         // Light theme should have a light background
         assert!(colors.bg.r > 0.5);
@@ -741,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn all_27_core_themes_produce_valid_colors() {
+    fn all_core_themes_produce_valid_colors() {
         for i in 0..gitkraft_core::THEME_COUNT {
             let core = gitkraft_core::theme_by_index(i);
             let c = ThemeColors::from_core(&core);

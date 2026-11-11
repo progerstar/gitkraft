@@ -32,7 +32,7 @@ use iced::{Alignment, Element, Length};
 use crate::features;
 use crate::icons;
 use crate::message::Message;
-use crate::state::{DragTarget, DragTargetH, GitKraft};
+use crate::state::{DragTarget, DragTargetH, GitKraft, LayoutStyle};
 use crate::theme;
 use crate::theme::ThemeColors;
 use crate::view_utils;
@@ -84,63 +84,6 @@ impl GitKraft {
             dims.staging_height,
         );
 
-        let sidebar: Element<'_, Message> = if show_sidebar || dims.overlay_sidebar {
-            let branches = features::branches::view::view(self);
-            let stash = features::stash::view::view(self);
-            let remotes = features::remotes::view::view(self);
-
-            let branches_divider =
-                widgets::divider::horizontal_divider(DragTargetH::SidebarBranchesBottom, &c);
-            let stash_divider =
-                widgets::divider::horizontal_divider(DragTargetH::SidebarStashBottom, &c);
-
-            // Three sections share the sidebar height using ratios.
-            let branches_pct = (self.sidebar_branches_ratio * 100.0) as u16;
-            let stash_pct = (self.sidebar_stash_ratio * 100.0) as u16;
-            let remotes_pct = 100u16
-                .saturating_sub(branches_pct)
-                .saturating_sub(stash_pct)
-                .max(5);
-
-            let sidebar_content = container(
-                column![
-                    container(branches)
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(branches_pct)),
-                    branches_divider,
-                    container(stash)
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(stash_pct)),
-                    stash_divider,
-                    container(remotes)
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(remotes_pct)),
-                ]
-                .width(Length::Fill)
-                .height(Length::Fill),
-            )
-            .width(Length::Fixed(sidebar_w))
-            .height(Length::Fill)
-            .style(theme::sidebar_style);
-
-            let divider = widgets::divider::vertical_divider(DragTarget::SidebarRight, &c);
-
-            row![sidebar_content, divider].height(Length::Fill).into()
-        } else {
-            Space::new().into()
-        };
-
-        // ── Commit log ────────────────────────────────────────────────────
-        let commit_log_content = container(features::commits::view::view(self))
-            .width(Length::Fixed(commit_w))
-            .height(Length::Fill);
-
-        let commit_divider = widgets::divider::vertical_divider(DragTarget::CommitLogRight, &c);
-
-        let commit_log: Element<'_, Message> = row![commit_log_content, commit_divider]
-            .height(Length::Fill)
-            .into();
-
         // ── Diff viewer (fills all remaining horizontal space) ────────────
         let diff_panel_content: Element<'_, Message> = {
             let tab = self.active_tab();
@@ -156,8 +99,74 @@ impl GitKraft {
             .width(Length::Fill)
             .height(Length::Fill);
 
+        let ghd = self.layout_style == LayoutStyle::GitHubDesktop;
+        // Sidebar and commit log column belong to the classic layout only.
+        let (sidebar, commit_log): (Element<'_, Message>, Element<'_, Message>) = if ghd {
+            (Space::new().into(), Space::new().into())
+        } else {
+            let sidebar: Element<'_, Message> = if show_sidebar || dims.overlay_sidebar {
+                let branches = features::branches::view::view(self);
+                let stash = features::stash::view::view(self);
+                let remotes = features::remotes::view::view(self);
+
+                let branches_divider =
+                    widgets::divider::horizontal_divider(DragTargetH::SidebarBranchesBottom, &c);
+                let stash_divider =
+                    widgets::divider::horizontal_divider(DragTargetH::SidebarStashBottom, &c);
+
+                // Three sections share the sidebar height using ratios.
+                let branches_pct = (self.sidebar_branches_ratio * 100.0) as u16;
+                let stash_pct = (self.sidebar_stash_ratio * 100.0) as u16;
+                let remotes_pct = 100u16
+                    .saturating_sub(branches_pct)
+                    .saturating_sub(stash_pct)
+                    .max(5);
+
+                let sidebar_content = container(
+                    column![
+                        container(branches)
+                            .width(Length::Fill)
+                            .height(Length::FillPortion(branches_pct)),
+                        branches_divider,
+                        container(stash)
+                            .width(Length::Fill)
+                            .height(Length::FillPortion(stash_pct)),
+                        stash_divider,
+                        container(remotes)
+                            .width(Length::Fill)
+                            .height(Length::FillPortion(remotes_pct)),
+                    ]
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fixed(sidebar_w))
+                .height(Length::Fill)
+                .style(theme::sidebar_style);
+
+                let divider = widgets::divider::vertical_divider(DragTarget::SidebarRight, &c);
+
+                row![sidebar_content, divider].height(Length::Fill).into()
+            } else {
+                Space::new().into()
+            };
+
+            // ── Commit log ────────────────────────────────────────────────────
+            let commit_log_content = container(features::commits::view::view(self))
+                .width(Length::Fixed(commit_w))
+                .height(Length::Fill);
+
+            let commit_divider = widgets::divider::vertical_divider(DragTarget::CommitLogRight, &c);
+
+            let commit_log: Element<'_, Message> = row![commit_log_content, commit_divider]
+                .height(Length::Fill)
+                .into();
+            (sidebar, commit_log)
+        };
+
         // ── Middle row: sidebar | divider | commit log | divider | diff ───
-        let middle: Element<'_, Message> = if dims.overlay_sidebar {
+        let middle: Element<'_, Message> = if ghd {
+            features::github_layout::view::body(self, commit_w, diff_viewer.into())
+        } else if dims.overlay_sidebar {
             let base = row![commit_log, diff_viewer]
                 .height(Length::Fill)
                 .width(Length::Fill);
@@ -203,12 +212,16 @@ impl GitKraft {
             main_col = main_col.push(delete_confirmation_banner(file_name, &c));
         }
 
-        main_col = main_col
-            .push(header)
-            .push(middle)
-            .push(h_divider)
-            .push(staging)
-            .push(status_bar);
+        if let Some(ref path) = tab.pending_discard {
+            main_col = main_col.push(discard_confirmation_banner(path, &c));
+        }
+
+        main_col = main_col.push(header).push(middle);
+        if !ghd {
+            // The GitHub Desktop layout keeps changes and the commit box in its left column.
+            main_col = main_col.push(h_divider).push(staging);
+        }
+        main_col = main_col.push(status_bar);
 
         let body = container(main_col)
             .width(Length::Fill)
@@ -227,6 +240,13 @@ impl GitKraft {
         let ma: Element<'_, Message> = if self.search_visible {
             let search_panel = search_overlay(self, &c);
             iced::widget::stack![ma, search_panel].into()
+        } else {
+            ma
+        };
+
+        // ── Branch dropdown (GitHub Desktop layout) ─────────────────────
+        let ma: Element<'_, Message> = if ghd && self.branch_popup_open {
+            features::github_layout::view::branch_popup(self, ma)
         } else {
             ma
         };
@@ -361,6 +381,47 @@ fn status_bar_view(state: &GitKraft) -> Element<'_, Message> {
         .into()
 }
 
+/// "Discard changes in …?" confirmation (the change cannot be recovered).
+fn discard_confirmation_banner<'a>(path: &str, c: &ThemeColors) -> Element<'a, Message> {
+    use iced::widget::{Space, button, row, text};
+
+    let label = text(format!(
+        "Discard changes in '{}'? This cannot be undone.",
+        gitkraft_core::path_basename(path)
+    ))
+    .size(13)
+    .color(c.text_primary);
+
+    let confirm_btn = button(text("Discard").size(12).color(c.red))
+        .padding([3, 12])
+        .style(theme::toolbar_button)
+        .on_press(Message::ConfirmDiscard(path.to_string()));
+
+    let cancel_btn = button(text("Cancel").size(12).color(c.text_secondary))
+        .padding([3, 12])
+        .style(theme::toolbar_button)
+        .on_press(Message::CancelDiscard);
+
+    let error_bg = c.error_bg;
+    container(
+        row![
+            label,
+            Space::new().width(12),
+            confirm_btn,
+            Space::new().width(6),
+            cancel_btn
+        ]
+        .align_y(iced::Alignment::Center)
+        .padding([6, 12]),
+    )
+    .width(Length::Fill)
+    .style(move |_| iced::widget::container::Style {
+        background: Some(iced::Background::Color(error_bg)),
+        ..Default::default()
+    })
+    .into()
+}
+
 fn delete_confirmation_banner<'a>(file_name: &str, c: &ThemeColors) -> Element<'a, Message> {
     use iced::widget::{Space, button, row, text};
 
@@ -416,6 +477,16 @@ fn error_banner<'a>(message: &str, c: &ThemeColors) -> Element<'a, Message> {
 
     let msg = text(message.to_string()).size(13).color(c.text_primary);
 
+    let copy = iced::widget::tooltip(
+        iced::widget::button(icon!(icons::CLIPBOARD, 14, c.text_secondary))
+            .padding([2, 6])
+            .on_press(Message::CopyText(message.to_string())),
+        container(text("Copy error").size(11))
+            .padding([4, 8])
+            .style(theme::context_menu_style),
+        iced::widget::tooltip::Position::Bottom,
+    );
+
     let dismiss = iced::widget::button(icon!(icons::X_CIRCLE, 14, c.text_secondary))
         .padding([2, 6])
         .on_press(Message::DismissError);
@@ -425,6 +496,8 @@ fn error_banner<'a>(message: &str, c: &ThemeColors) -> Element<'a, Message> {
         Space::new().width(8),
         msg,
         Space::new().width(Length::Fill),
+        copy,
+        Space::new().width(4),
         dismiss,
     ]
     .align_y(Alignment::Center)
@@ -1094,6 +1167,12 @@ fn context_menu_panel<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, M
                     Message::CheckoutRemoteBranch(name.clone()),
                 ));
             }
+
+            // Merge into the checked-out branch (like pulling it)
+            col = col.push(menu_item(
+                "Merge into current branch",
+                Message::MergeRemoteBranch(name.clone()),
+            ));
 
             // Delete from remote
             col = col.push(view_utils::context_menu_separator::<Message>());

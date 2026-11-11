@@ -4,9 +4,9 @@
 pub const SYSTEM_THEME_NAME: &str = "System";
 
 /// Preset used while the system is in dark mode (index into `THEME_NAMES`).
-pub const SYSTEM_DARK_INDEX: usize = 0; // "Default"
+pub const SYSTEM_DARK_INDEX: usize = 2; // "Desk Dark"
 /// Preset used while the system is in light mode (index into `THEME_NAMES`).
-pub const SYSTEM_LIGHT_INDEX: usize = 1; // "Default Light"
+pub const SYSTEM_LIGHT_INDEX: usize = 3; // "Desk Light"
 
 /// Whether `name` is the "follow system" pseudo-theme (case-insensitive).
 pub fn is_system_name(name: &str) -> bool {

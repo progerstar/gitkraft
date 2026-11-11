@@ -200,7 +200,8 @@ impl crate::state::GitKraft {
         LayoutDims::compute(
             self.window_width,
             self.window_height,
-            self.sidebar_expanded,
+            // The GitHub Desktop layout has no sidebar (branches live in a dropdown).
+            self.sidebar_expanded && self.layout_style == crate::state::LayoutStyle::Classic,
             self.sidebar_width,
             self.commit_log_width,
             self.staging_height,

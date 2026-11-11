@@ -17,6 +17,7 @@ pub enum Editor {
     VSCode,
     Zed,
     Sublime,
+    LiteXl,
     RustRover,
     IntelliJIdea,
     WebStorm,
@@ -48,6 +49,7 @@ pub const EDITOR_NAMES: &[&str] = &[
     "CLion",
     "Fleet",
     "Android Studio",
+    "Lite XL",
 ];
 
 impl Editor {
@@ -83,6 +85,19 @@ impl Editor {
             Editor::VSCode => vec!["code --reuse-window".into()],
             Editor::Zed => vec!["zed".into()],
             Editor::Sublime => vec!["subl".into()],
+            Editor::LiteXl => {
+                // The official installer puts it in ~/.local/bin, which apps
+                // started from a desktop launcher often lack in PATH.
+                let mut c = vec!["lite-xl".to_string()];
+                if let Some(home) = dirs::home_dir() {
+                    c.push(
+                        home.join(".local/bin/lite-xl")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                c
+            }
             Editor::RustRover => vec!["rustrover".into()],
             Editor::IntelliJIdea => vec!["idea".into()],
             Editor::WebStorm => vec!["webstorm".into()],
@@ -120,6 +135,7 @@ impl Editor {
             Editor::VSCode => Some("Visual Studio Code"),
             Editor::Zed => Some("Zed"),
             Editor::Sublime => Some("Sublime Text"),
+            Editor::LiteXl => Some("Lite XL"),
             Editor::RustRover => Some("RustRover"),
             Editor::IntelliJIdea => Some("IntelliJ IDEA"),
             Editor::WebStorm => Some("WebStorm"),
@@ -147,6 +163,7 @@ impl Editor {
             Editor::VSCode => "VS Code",
             Editor::Zed => "Zed",
             Editor::Sublime => "Sublime Text",
+            Editor::LiteXl => "Lite XL",
             Editor::RustRover => "RustRover",
             Editor::IntelliJIdea => "IntelliJ IDEA",
             Editor::WebStorm => "WebStorm",
@@ -179,6 +196,7 @@ impl Editor {
             14 => Editor::CLion,
             15 => Editor::Fleet,
             16 => Editor::AndroidStudio,
+            17 => Editor::LiteXl,
             _ => Editor::None,
         }
     }
@@ -370,7 +388,7 @@ mod tests {
 
     #[test]
     fn editor_names_count_matches() {
-        assert_eq!(EDITOR_NAMES.len(), 17);
+        assert_eq!(EDITOR_NAMES.len(), 18);
     }
 
     #[test]
@@ -390,6 +408,15 @@ mod tests {
     fn editor_display_implements_display_trait() {
         let editor = Editor::Neovim;
         assert_eq!(format!("{editor}"), "Neovim");
+    }
+
+    #[test]
+    fn lite_xl_is_a_gui_editor_named_consistently() {
+        assert_eq!(Editor::LiteXl.binary(), Some("lite-xl".into()));
+        assert!(!Editor::LiteXl.is_terminal_editor());
+        let idx = EDITOR_NAMES.iter().position(|n| *n == "Lite XL").unwrap();
+        assert_eq!(Editor::from_index(idx), Editor::LiteXl);
+        assert_eq!(Editor::LiteXl.display_name(), "Lite XL");
     }
 
     #[test]

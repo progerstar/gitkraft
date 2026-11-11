@@ -64,7 +64,23 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
         // If `close_btn` were nested here, clicking × on the active tab
         // could have its `is_pressed` flag wiped by the intervening
         // SwitchTab update before ButtonReleased arrives.
-        let tab_content = row![icon, Space::new().width(6), label].align_y(Alignment::Center);
+        let mut tab_content = row![icon, Space::new().width(6), label].align_y(Alignment::Center);
+
+        // Commits to push (↑) / pull (↓) for the checked-out branch, against
+        // its upstream as of the last fetch.
+        let (ahead, behind) = tab.upstream_ahead_behind();
+        if ahead > 0 {
+            tab_content = tab_content
+                .push(Space::new().width(6))
+                .push(icon!(icons::ARROW_UP_SHORT, 13, c.accent))
+                .push(text(ahead.to_string()).size(11).color(c.accent));
+        }
+        if behind > 0 {
+            tab_content = tab_content
+                .push(Space::new().width(if ahead > 0 { 2 } else { 6 }))
+                .push(icon!(icons::ARROW_DOWN_SHORT, 13, c.yellow))
+                .push(text(behind.to_string()).size(11).color(c.yellow));
+        }
 
         let tab_style = if is_active {
             theme::active_tab_button as fn(&iced::Theme, button::Status) -> button::Style

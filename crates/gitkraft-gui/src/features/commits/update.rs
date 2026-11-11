@@ -158,7 +158,7 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             let staged_empty;
             {
                 let tab = state.active_tab();
-                msg = tab.commit_message.trim().to_string();
+                msg = full_commit_message(&tab.commit_message, &tab.commit_description.text());
                 staged_empty = tab.staged_changes.is_empty();
             }
             if msg.is_empty() || staged_empty {
@@ -176,7 +176,11 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
                     {
                         let tab = state.active_tab_mut();
                         tab.commit_message.clear();
+                        tab.commit_description = iced::widget::text_editor::Content::new();
                         tab.status_message = Some("Commit created.".into());
+                    }
+                    if state.push_after_commit {
+                        return push_after_commit(state);
                     }
                     state.refresh_active_tab()
                 }
@@ -304,6 +308,125 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::CommitDescriptionAction(action) => {
+            state.active_tab_mut().commit_description.perform(action);
+            Task::none()
+        }
+
+        Message::GenerateCommitMessage => {
+            let tab = state.active_tab();
+            if tab.generating_commit_message || tab.staged_changes.is_empty() {
+                return Task::none();
+            }
+            with_repo!(state, "Generating commit message…".into(), |repo_path| {
+                let tab = state.active_tab_mut();
+                tab.generating_commit_message = true;
+                // Clear the old message right away; keep it in case of failure.
+                let old_description = std::mem::take(&mut tab.commit_description).text();
+                let old_summary = std::mem::take(&mut tab.commit_message);
+                tab.commit_message_backup = Some((old_summary, old_description));
+                commands::generate_commit_message(repo_path)
+            })
+        }
+
+        Message::CommitMessageGenerated(path, result) => {
+            // The agent can take a while: write into the tab that asked,
+            // even if the user switched tabs meanwhile.
+            let Some(tab) = state
+                .tabs
+                .iter_mut()
+                .find(|t| t.repo_path.as_deref() == Some(path.as_path()))
+            else {
+                return Task::none();
+            };
+            tab.generating_commit_message = false;
+            let backup = tab.commit_message_backup.take();
+            match result {
+                Ok(message) => {
+                    let (summary, description) = gitkraft_core::split_commit_message(&message);
+                    tab.commit_message = summary;
+                    tab.commit_description =
+                        iced::widget::text_editor::Content::with_text(&description);
+                    tab.status_message = Some("Commit message generated.".into());
+                    // Show the start of the summary, not wherever the cursor was.
+                    iced::widget::operation::move_cursor_to_front(iced::widget::Id::new(
+                        "commit_message_input",
+                    ))
+                }
+                Err(e) => {
+                    // Put back what the user had, unless they typed something new.
+                    if let Some((summary, description)) = backup
+                        && tab.commit_message.is_empty()
+                        && tab.commit_description.text().trim().is_empty()
+                    {
+                        tab.commit_message = summary;
+                        tab.commit_description =
+                            iced::widget::text_editor::Content::with_text(&description);
+                    }
+                    tab.error_message = Some(format!("Commit message generation failed: {e}"));
+                    tab.status_message = None;
+                    Task::none()
+                }
+            }
+        }
+
+        Message::TogglePushAfterCommit(enabled) => {
+            state.push_after_commit = enabled;
+            commands::save_push_after_commit(enabled)
+        }
+
         _ => Task::none(),
+    }
+}
+
+/// Summary plus optional description, separated by a blank line.
+fn full_commit_message(summary: &str, description: &str) -> String {
+    let (summary, description) = (summary.trim(), description.trim());
+    if summary.is_empty() || description.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{summary}\n\n{description}")
+    }
+}
+
+/// Push the current branch after a commit (the repo reloads when it
+/// finishes). Skipped without a remote or on a detached HEAD.
+fn push_after_commit(state: &mut GitKraft) -> Task<Message> {
+    let tab = state.active_tab();
+    let skip_reason = if tab.remotes.is_empty() {
+        Some("no remote configured")
+    } else if tab.current_branch.is_none() {
+        Some("detached HEAD")
+    } else {
+        None
+    };
+    if let Some(reason) = skip_reason {
+        state.active_tab_mut().status_message =
+            Some(format!("Commit created. Push skipped: {reason}."));
+        return state.refresh_active_tab();
+    }
+    let remote = tab.default_remote();
+    let branch = tab.current_branch.clone().unwrap_or_default();
+    with_repo!(
+        state,
+        loading,
+        format!("Commit created. Pushing '{branch}' to {remote}…"),
+        |path| crate::features::repo::commands::push_branch_async(path, branch, remote)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_commit_message;
+
+    #[test]
+    fn full_message_joins_summary_and_description() {
+        assert_eq!(full_commit_message(" Fix bug ", ""), "Fix bug");
+        assert_eq!(
+            full_commit_message("Fix bug", "\nWhy it broke\n"),
+            "Fix bug\n\nWhy it broke"
+        );
+        // A description alone is not a commit message.
+        assert_eq!(full_commit_message("  ", "body"), "");
     }
 }

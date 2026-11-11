@@ -301,6 +301,8 @@ pub fn diff_file_commit_vs_workdir(
                         "@@ No changes — file is identical to working tree @@".to_string(),
                     )],
                 }],
+                old_id: tree_blob_id(&commit_tree, file_path),
+                new_id: None,
             })
         }
         (true, false) => {
@@ -333,6 +335,8 @@ pub fn diff_file_commit_vs_workdir(
                 new_file: String::new(),
                 status: FileStatus::Deleted,
                 hunks,
+                old_id: Some(blob_entry.id().to_string()),
+                new_id: None,
             })
         }
         (false, true) => {
@@ -371,6 +375,18 @@ pub fn file_list_commit_vs_workdir(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Blob id of `path` inside `tree`, if present.
+fn tree_blob_id(tree: &git2::Tree<'_>, path: &str) -> Option<String> {
+    tree.get_path(std::path::Path::new(path))
+        .ok()
+        .map(|e| e.id().to_string())
+}
+
+/// Hex blob id, or `None` for the all-zero id git2 uses for "no blob".
+fn blob_id(oid: git2::Oid) -> Option<String> {
+    (!oid.is_zero()).then(|| oid.to_string())
+}
 
 /// Extract lightweight `DiffFileEntry` values from a `git2::Diff` (paths + status only).
 fn diff_file_entries(diff: &Diff<'_>) -> Vec<DiffFileEntry> {
@@ -421,6 +437,8 @@ fn parse_diff(diff: &Diff<'_>) -> Result<Vec<DiffInfo>> {
             new_file,
             status,
             hunks: Vec::new(),
+            old_id: blob_id(delta.old_file().id()),
+            new_id: blob_id(delta.new_file().id()),
         });
     }
 

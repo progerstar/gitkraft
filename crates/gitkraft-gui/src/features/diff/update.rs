@@ -2,6 +2,9 @@
 
 use iced::Task;
 
+use gitkraft_core::ImageKind;
+
+use super::image_view;
 use crate::message::Message;
 use crate::state::GitKraft;
 
@@ -132,6 +135,48 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::ImagePreviewLoaded(preview) => {
+            if let Some(tab) = state
+                .tabs
+                .iter_mut()
+                .find(|t| t.image_preview_pending.as_deref() == Some(preview.key.as_str()))
+            {
+                tab.image_preview_pending = None;
+                tab.image_preview = Some(preview);
+            }
+            Task::none()
+        }
+
+        Message::ToggleSvgText => {
+            state.svg_as_text = !state.svg_as_text;
+            Task::none()
+        }
+
         _ => Task::none(),
+    }
+}
+
+impl GitKraft {
+    /// If the active tab shows an image diff whose images are not loaded
+    /// (or loading) yet, start loading them.
+    pub(crate) fn ensure_image_preview(&mut self) -> Task<Message> {
+        let svg_as_text = self.svg_as_text;
+        let tab = self.active_tab();
+        let (Some(diff), Some(path)) = (tab.selected_diff.as_ref(), tab.repo_path.as_ref()) else {
+            return Task::none();
+        };
+        let Some(key) = image_view::image_key(diff) else {
+            return Task::none();
+        };
+        if svg_as_text && gitkraft_core::image_kind(diff.display_path()) == Some(ImageKind::Svg) {
+            return Task::none();
+        }
+        let loaded = tab.image_preview.as_ref().is_some_and(|p| p.key == key);
+        if loaded || tab.image_preview_pending.as_deref() == Some(key.as_str()) {
+            return Task::none();
+        }
+        let (diff, path) = (diff.clone(), path.clone());
+        self.active_tab_mut().image_preview_pending = Some(key.clone());
+        image_view::load_image_preview(path, key, diff)
     }
 }

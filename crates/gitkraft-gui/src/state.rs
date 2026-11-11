@@ -65,6 +65,45 @@ pub enum ContextMenu {
     CommitFile { oid: String, file_path: String },
 }
 
+// ── Layout style (fork) ───────────────────────────────────────────────────────
+
+/// Overall arrangement of the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutStyle {
+    /// GitKraft's own: sidebar | commit log | diff, staging strip below.
+    Classic,
+    /// GitHub Desktop's: Changes/History column | diff, branches in a dropdown.
+    #[default]
+    GitHubDesktop,
+}
+
+impl LayoutStyle {
+    /// Parse the persisted value; anything unknown (including the earlier
+    /// `"github-desktop"`) means the default two-pane layout.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("classic") => Self::Classic,
+            _ => Self::GitHubDesktop,
+        }
+    }
+
+    /// Value stored in `settings.json`.
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::GitHubDesktop => "two-pane",
+        }
+    }
+}
+
+/// Left-column tab in the GitHub Desktop layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GhdTab {
+    #[default]
+    Changes,
+    History,
+}
+
 // ── Per-repository tab state ──────────────────────────────────────────────────
 
 /// Per-repository state — one instance per open tab.
@@ -230,6 +269,18 @@ pub struct RepoTab {
 
     /// When `Some(path)`, a delete-confirmation banner is shown for that file.
     pub pending_delete_file: Option<String>,
+
+    // ── Fork extras ───────────────────────────────────────────────────────
+    /// Multi-line commit description (body), below the summary input.
+    pub commit_description: iced::widget::text_editor::Content,
+    /// An AI commit-message request is in flight.
+    pub generating_commit_message: bool,
+    /// Summary and description cleared by the AI request, restored if it fails.
+    pub commit_message_backup: Option<(String, String)>,
+    /// Rendered before/after images for the selected diff, when it is an image.
+    pub image_preview: Option<crate::features::diff::image_view::ImagePreview>,
+    /// Key of the image preview being loaded (avoids duplicate loads).
+    pub image_preview_pending: Option<String>,
 }
 
 impl RepoTab {
@@ -296,6 +347,11 @@ impl RepoTab {
             blame_lines: Vec::new(),
             blame_scroll: 0.0,
             pending_delete_file: None,
+            commit_description: iced::widget::text_editor::Content::new(),
+            generating_commit_message: false,
+            commit_message_backup: None,
+            image_preview: None,
+            image_preview_pending: None,
         }
     }
 
@@ -310,6 +366,24 @@ impl RepoTab {
             .first()
             .map(|r| r.name.clone())
             .unwrap_or_else(|| "origin".to_string())
+    }
+
+    /// Commits the checked-out branch is ahead of / behind its upstream
+    /// (as of the last fetch); `(0, 0)` without an upstream.
+    pub fn upstream_ahead_behind(&self) -> (usize, usize) {
+        let Some(current) = self.current_branch.as_deref() else {
+            return (0, 0);
+        };
+        self.branches
+            .iter()
+            .find(|b| !b.is_remote() && b.name == current)
+            .map(|b| {
+                (
+                    b.upstream_ahead.unwrap_or(0),
+                    b.upstream_behind.unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0))
     }
 
     /// Display name for the tab (last path component, or "New Tab").
@@ -618,6 +692,19 @@ pub struct GitKraft {
     pub preview_editor: Option<iced::widget::text_editor::Content>,
     /// Path of the file being previewed (for the header display).
     pub preview_path: Option<String>,
+
+    /// Push the current branch after every successful commit.
+    pub push_after_commit: bool,
+    /// Show SVG files as a text diff instead of rendered images.
+    pub svg_as_text: bool,
+    /// Classic or GitHub Desktop arrangement.
+    pub layout_style: LayoutStyle,
+    /// Active left-column tab in the GitHub Desktop layout.
+    pub ghd_tab: GhdTab,
+    /// The "Current branch" dropdown (branches, stashes, remotes) is open.
+    pub branch_popup_open: bool,
+    /// Where the branch dropdown was opened (window coordinates).
+    pub branch_popup_pos: (f32, f32),
 }
 
 impl Default for GitKraft {
@@ -749,6 +836,13 @@ impl GitKraft {
 
             preview_editor: None,
             preview_path: None,
+
+            push_after_commit: settings.push_after_commit,
+            svg_as_text: false,
+            layout_style: LayoutStyle::from_setting(settings.layout_style.as_deref()),
+            ghd_tab: GhdTab::default(),
+            branch_popup_open: false,
+            branch_popup_pos: (0.0, 0.0),
         }
     }
 
@@ -974,7 +1068,7 @@ impl GitKraft {
         gitkraft_core::THEME_NAMES
             .get(self.current_theme_index)
             .copied()
-            .unwrap_or("Default")
+            .unwrap_or(gitkraft_core::THEME_NAMES[0])
     }
 
     /// Refresh all data for the currently active tab's repository.
@@ -1072,6 +1166,7 @@ fn detect_system_editor() -> gitkraft_core::Editor {
                 "code" => gitkraft_core::Editor::VSCode,
                 "zed" => gitkraft_core::Editor::Zed,
                 "subl" => gitkraft_core::Editor::Sublime,
+                "lite-xl" => gitkraft_core::Editor::LiteXl,
                 _ => gitkraft_core::Editor::Custom(val),
             };
         }
@@ -1125,33 +1220,29 @@ mod tests {
     fn iced_theme_is_custom_with_correct_palette() {
         let mut state = GitKraft::new();
 
-        // Index 0 = Default (dark) — custom theme with dark background
+        // Index 0 = Ember (dark, the default) — custom theme with dark background
         state.current_theme_index = 0;
         let iced_t = state.iced_theme();
         let pal = iced_t.palette();
-        assert!(pal.background.r < 0.5, "Default theme bg should be dark");
-        assert_eq!(iced_t.to_string(), "Default");
+        assert!(pal.background.r < 0.5, "Ember bg should be dark");
+        assert_eq!(iced_t.to_string(), "Ember");
 
-        // Solarized Light — custom theme with light background
-        let sol_idx = gitkraft_core::theme_index_by_name("Solarized Light");
-        state.current_theme_index = sol_idx;
+        // Desk Light — custom theme with light background
+        let gh_idx = gitkraft_core::theme_index_by_name("Desk Light");
+        state.current_theme_index = gh_idx;
         let iced_t = state.iced_theme();
         let pal = iced_t.palette();
-        assert!(pal.background.r > 0.5, "Solarized Light bg should be light");
-        assert_eq!(iced_t.to_string(), "Solarized Light");
+        assert!(pal.background.r > 0.5, "Desk Light bg should be light");
+        assert_eq!(iced_t.to_string(), "Desk Light");
 
-        // Gruvbox Dark — accent should come from core
-        let gruvbox_idx = gitkraft_core::theme_index_by_name("Gruvbox Dark");
-        state.current_theme_index = gruvbox_idx;
-        let iced_t = state.iced_theme();
-        let pal = iced_t.palette();
-        let core = gitkraft_core::theme_by_index(gruvbox_idx);
+        // Accent should come from core
+        let core = gitkraft_core::theme_by_index(gh_idx);
         let expected_accent = rgb_to_iced(core.accent);
         assert!(
             (pal.primary.r - expected_accent.r).abs() < 0.01
                 && (pal.primary.g - expected_accent.g).abs() < 0.01
                 && (pal.primary.b - expected_accent.b).abs() < 0.01,
-            "Gruvbox Dark accent should match core accent"
+            "Desk Light accent should match core accent"
         );
     }
 
@@ -1177,10 +1268,10 @@ mod tests {
     #[test]
     fn current_theme_name_round_trips() {
         let mut state = GitKraft::new();
-        state.current_theme_index = gitkraft_core::theme_index_by_name("Dracula");
-        assert_eq!(state.current_theme_name(), "Dracula");
+        state.current_theme_index = gitkraft_core::theme_index_by_name("Desk Light");
+        assert_eq!(state.current_theme_name(), "Desk Light");
         state.current_theme_index = 0;
-        assert_eq!(state.current_theme_name(), "Default");
+        assert_eq!(state.current_theme_name(), "Ember");
     }
 
     #[test]
@@ -1330,6 +1421,8 @@ mod tests {
             new_file: "a.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         });
         tab.multi_file_diffs.clear();
         assert!(tab.multi_file_diffs.is_empty());
@@ -1350,6 +1443,8 @@ mod tests {
             new_file: "x.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         });
         tab.commit_range_diffs.clear();
         assert!(tab.commit_range_diffs.is_empty());
@@ -1421,6 +1516,8 @@ mod tests {
             new_file: "a.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
 
         // Regular click — should NOT clear multi_file_diffs immediately
@@ -1470,12 +1567,16 @@ mod tests {
             new_file: "a.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
         state.active_tab_mut().commit_range_diffs = vec![gitkraft_core::DiffInfo {
             old_file: String::new(),
             new_file: "b.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
         state.active_tab_mut().is_loading_file_diff = true;
         state.active_tab_mut().diff_scroll_offset = 200.0;
@@ -1486,6 +1587,8 @@ mod tests {
             new_file: "b.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         };
         let _ = state.update(Message::SingleFileDiffLoaded(Ok(new_diff)));
 
@@ -1528,6 +1631,8 @@ mod tests {
             new_file: "x.rs".to_string(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
 
         let _ = state.update(Message::SelectDiffByIndex(0));
@@ -2653,6 +2758,8 @@ mod tests {
             new_file: "a.rs".into(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
 
         // Background refresh with the same commits.
@@ -2684,6 +2791,8 @@ mod tests {
             new_file: "a.rs".into(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
 
         // Payload with completely different commits (force-push).
@@ -2721,6 +2830,8 @@ mod tests {
             new_file: "x.rs".into(),
             status: gitkraft_core::FileStatus::Modified,
             hunks: vec![],
+            old_id: None,
+            new_id: None,
         }];
 
         let mut payload = fake_payload("/tmp/repo");
@@ -3767,12 +3878,12 @@ mod tests {
         assert!(state.follow_system);
         assert_eq!(state.persisted_theme_name(), "System");
         assert!(state.current_theme_index < gitkraft_core::THEME_COUNT);
-        let nord = gitkraft_core::theme_index_by_name("Nord");
-        assert!(state.apply_theme_choice(nord));
+        let gh = gitkraft_core::theme_index_by_name("Desk Light");
+        assert!(state.apply_theme_choice(gh));
         assert!(!state.follow_system);
-        assert_eq!(state.persisted_theme_name(), "Nord");
+        assert_eq!(state.persisted_theme_name(), "Desk Light");
         assert!(!state.apply_theme_choice(gitkraft_core::THEME_COUNT + 5));
-        assert_eq!(state.current_theme_index, nord);
+        assert_eq!(state.current_theme_index, gh);
     }
 
     #[test]

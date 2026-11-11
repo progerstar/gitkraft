@@ -33,7 +33,8 @@ tempfile     = "3"
 tracing            = "0.1"
 
 # GUI (Iced)
-iced         = { version = "0.14", features = ["advanced", "canvas"] }
+iced         = { version = "0.14", features = ["advanced", "canvas", "image", "svg"] }
+image        = { version = "0.25", default-features = false }  # image-diff dimensions (codecs come via iced)
 iced_fonts   = { version = "0.3", features = ["bootstrap"] }
 rfd          = "0.17"
 winresource  = { version = "0.1", default-features = false }  # gitkraft.exe icon (build script)

@@ -4,6 +4,7 @@ pub mod branches;
 pub mod commits;
 pub mod diff;
 pub mod editor;
+pub mod github_layout;
 pub mod remotes;
 pub mod repo;
 pub mod staging;

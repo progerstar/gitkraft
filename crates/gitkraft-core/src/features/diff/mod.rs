@@ -2,10 +2,12 @@
 //! per-commit diffs.
 
 pub mod blame;
+pub mod image;
 pub mod ops;
 pub mod types;
 
 pub use blame::{BlameLine, blame_file};
+pub use image::{ImageDiff, ImageKind, image_kind, load_image_diff};
 pub use ops::{
     checkout_file_at_commit, diff_file_commit_vs_workdir, file_list_commit_vs_workdir,
     get_commit_diff, get_commit_file_list, get_commit_range_diff, get_single_file_diff,

@@ -9,7 +9,7 @@ use crate::features::editor::editor_selector;
 use crate::features::theme::view::theme_selector;
 use crate::icons;
 use crate::message::Message;
-use crate::state::GitKraft;
+use crate::state::{GitKraft, LayoutStyle};
 use crate::theme;
 use crate::view_utils;
 
@@ -70,6 +70,49 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
         fetch_msg,
     );
 
+    // ── Pull / Push (shown when there is something to sync) ──────────────
+    // Like GitHub Desktop: Pull when the upstream has new commits (it merges,
+    // so it also resolves a diverged branch), otherwise Push when local
+    // commits are waiting.
+    let (ahead, behind) = tab.upstream_ahead_behind();
+    let remote = tab.default_remote();
+    let sync_button = |glyph: char, color: iced::Color, label: String, count: usize, msg| {
+        let mut content = row![icon!(glyph, 14, color)].align_y(Alignment::Center);
+        if !compact {
+            content = content
+                .push(Space::new().width(4))
+                .push(text(label).size(12));
+        }
+        content = content
+            .push(Space::new().width(4))
+            .push(text(count.to_string()).size(12).color(color));
+        let btn: Element<'_, Message> = button(content)
+            .padding([4, if compact { 8 } else { 10 }])
+            .style(theme::toolbar_button)
+            .on_press(msg)
+            .into();
+        btn
+    };
+    let sync_btn: Element<'_, Message> = if behind > 0 {
+        sync_button(
+            icons::ARROW_DOWN_SHORT,
+            c.yellow,
+            format!("Pull {remote}"),
+            behind,
+            Message::PullMerge,
+        )
+    } else if let (true, Some(branch)) = (ahead > 0, tab.current_branch.clone()) {
+        sync_button(
+            icons::ARROW_UP_SHORT,
+            c.accent,
+            format!("Push {remote}"),
+            ahead,
+            Message::PushBranch(branch),
+        )
+    } else {
+        Space::new().into()
+    };
+
     // ── Open another repo button ──────────────────────────────────────────
     let open_icon = icon!(icons::FOLDER_OPEN, 14, c.text_secondary);
 
@@ -124,25 +167,78 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
     };
 
     // ── Assemble ──────────────────────────────────────────────────────────
-    let left_items = row![
-        sidebar_btn,
-        Space::new().width(8),
-        repo_icon,
-        Space::new().width(6),
-        repo_name,
-        Space::new().width(10),
-        separator(),
-        Space::new().width(10),
-        branch_icon,
-        Space::new().width(6),
-        branch_label,
-        state_badge,
-        Space::new().width(10),
-        separator(),
-        Space::new().width(10),
-        loading_indicator,
-    ]
-    .align_y(Alignment::Center);
+    let ghd = state.layout_style == LayoutStyle::GitHubDesktop;
+    let left_items = if ghd {
+        // GitHub Desktop: no sidebar; the branch is a dropdown with branches,
+        // stashes and remotes.
+        let branch_btn = button(
+            row![
+                icon!(icons::GIT_BRANCH, 13, c.green),
+                Space::new().width(6),
+                text("Current branch").size(12).color(c.muted),
+                Space::new().width(6),
+                text(branch_name_str)
+                    .size(12)
+                    .color(c.text_primary)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                Space::new().width(8),
+                icon!(icons::CARET_DOWN_FILL, 10, c.text_secondary),
+            ]
+            .align_y(Alignment::Center),
+        )
+        // Same height as the other toolbar buttons.
+        .padding([4, 10])
+        .style(theme::toolbar_button)
+        .on_press(Message::ToggleBranchPopup);
+        row![
+            repo_icon,
+            Space::new().width(6),
+            repo_name,
+            Space::new().width(12),
+            branch_btn,
+            state_badge,
+            Space::new().width(10),
+            loading_indicator,
+        ]
+        .align_y(Alignment::Center)
+    } else {
+        row![
+            sidebar_btn,
+            Space::new().width(8),
+            repo_icon,
+            Space::new().width(6),
+            repo_name,
+            Space::new().width(10),
+            separator(),
+            Space::new().width(10),
+            branch_icon,
+            Space::new().width(6),
+            branch_label,
+            state_badge,
+            Space::new().width(10),
+            separator(),
+            Space::new().width(10),
+            loading_indicator,
+        ]
+        .align_y(Alignment::Center)
+    };
+
+    // Switch between the classic and two-pane layouts.
+    let (layout_glyph, layout_tip) = if ghd {
+        (icons::LAYOUT_THREE_COLUMNS, "Switch to the classic layout")
+    } else {
+        (icons::LAYOUT_SIDEBAR, "Switch to the two-pane layout")
+    };
+    let layout_btn = iced::widget::tooltip(
+        button(icon!(layout_glyph, 14, c.text_secondary))
+            .padding([4, 8])
+            .style(theme::toolbar_button)
+            .on_press(Message::ToggleLayoutStyle),
+        container(text(layout_tip).size(11))
+            .padding([4, 8])
+            .style(theme::context_menu_style),
+        iced::widget::tooltip::Position::Bottom,
+    );
 
     let settings_btn = view_utils::toolbar_btn_adaptive(
         icon!(icons::GEAR, 14, c.text_secondary),
@@ -159,7 +255,11 @@ pub fn view(state: &GitKraft) -> Element<'_, Message> {
 
     let theme_w = if compact { 140.0 } else { 180.0 };
     let mut right_items = row![
+        layout_btn,
+        Space::new().width(4),
         fetch_btn,
+        Space::new().width(4),
+        sync_btn,
         Space::new().width(4),
         open_btn,
         Space::new().width(4),

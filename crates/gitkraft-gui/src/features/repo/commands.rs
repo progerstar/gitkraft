@@ -16,31 +16,47 @@ use crate::macros::StringErr;
 use crate::message::{Message, RepoPayload};
 
 /// Open a folder-picker dialog and return the selected path.
-pub(crate) fn pick_folder_open() -> Task<Message> {
-    Task::perform(
-        async {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("Open Git Repository")
-                .pick_folder()
-                .await;
-            handle.map(|h| h.path().to_path_buf())
-        },
-        Message::RepoSelected,
-    )
+pub(crate) fn pick_folder_open(start: Option<PathBuf>) -> Task<Message> {
+    pick_folder("Open Git Repository", start, Message::RepoSelected)
 }
 
 /// Open a folder-picker dialog for initialising a new repository.
-pub(crate) fn pick_folder_init() -> Task<Message> {
-    Task::perform(
-        async {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("Choose folder for new repository")
-                .pick_folder()
-                .await;
-            handle.map(|h| h.path().to_path_buf())
-        },
+pub(crate) fn pick_folder_init(start: Option<PathBuf>) -> Task<Message> {
+    pick_folder(
+        "Choose folder for new repository",
+        start,
         Message::RepoInitSelected,
     )
+}
+
+/// Folder picker attached to the main window (so the desktop shows it on top
+/// of GitKraft, not behind it) and starting in `start` (or the home folder).
+/// Some portal backends misbehave without a starting folder.
+fn pick_folder(
+    title: &'static str,
+    start: Option<PathBuf>,
+    on_pick: fn(Option<PathBuf>) -> Message,
+) -> Task<Message> {
+    let start = start.or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    iced::window::oldest()
+        .and_then(move |id| {
+            let start = start.clone();
+            iced::window::run(id, move |window| {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title(title)
+                    .set_parent(window);
+                match start {
+                    Some(dir) => dialog.set_directory(dir),
+                    None => dialog,
+                }
+            })
+        })
+        .then(move |dialog| {
+            Task::perform(
+                async move { dialog.pick_folder().await.map(|h| h.path().to_path_buf()) },
+                on_pick,
+            )
+        })
 }
 
 /// Load (open) a repository at `path` and gather all initial state.
@@ -64,6 +80,23 @@ pub(crate) fn refresh_repo(path: PathBuf, current_commit_count: usize) -> Task<M
     git_task!(
         Message::RepoRefreshed,
         gitkraft_core::load_repo_snapshot_with_depth(&path, current_commit_count).str_err()
+    )
+}
+
+/// Background fetch, then reload the repo so ahead/behind counts update.
+/// Failures (offline, credentials needed) are dropped silently.
+pub(crate) fn auto_fetch(path: PathBuf, current_commit_count: usize) -> Task<Message> {
+    git_task!(
+        |result: Result<RepoPayload, String>| match result {
+            Ok(payload) => Message::RepoRefreshed(Ok(payload)),
+            // Offline or credentials needed: try again next time.
+            Err(_) => Message::Noop,
+        },
+        (|| {
+            let wd = workdir(&path)?;
+            gitkraft_core::features::branches::fetch_all_quiet(&wd).str_err()?;
+            gitkraft_core::load_repo_snapshot_with_depth(&path, current_commit_count).str_err()
+        })()
     )
 }
 
@@ -101,6 +134,20 @@ pub(crate) fn force_push_branch_async(
 ) -> Task<Message> {
     git_wd_then_reload!(path, |wd| {
         gitkraft_core::features::branches::force_push_branch(&wd, &branch, &remote)
+    })
+}
+
+/// `git pull` with merge (or the configured `pull.rebase`) then reload.
+pub(crate) fn pull_merge_async(path: PathBuf) -> Task<Message> {
+    git_wd_then_reload!(path, |wd| gitkraft_core::features::branches::pull_merge(
+        &wd
+    ))
+}
+
+/// Merge `refname` (a remote branch) into the current branch then reload.
+pub(crate) fn merge_ref_async(path: PathBuf, refname: String) -> Task<Message> {
+    git_wd_then_reload!(path, |wd| {
+        gitkraft_core::features::branches::merge_ref_cli(&wd, &refname)
     })
 }
 

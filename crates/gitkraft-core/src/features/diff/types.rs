@@ -101,6 +101,13 @@ pub struct DiffInfo {
     pub status: FileStatus,
     /// Hunks that make up the diff for this file.
     pub hunks: Vec<DiffHunk>,
+    /// Blob id of the old side, when it exists in the object database.
+    #[serde(default)]
+    pub old_id: Option<String>,
+    /// Blob id of the new side. `None` (or an id missing from the object
+    /// database) means the new side lives in the working directory.
+    #[serde(default)]
+    pub new_id: Option<String>,
 }
 
 impl DiffInfo {
@@ -194,6 +201,8 @@ mod tests {
             new_file: new.to_string(),
             status,
             hunks: Vec::new(),
+            old_id: None,
+            new_id: None,
         }
     }
 

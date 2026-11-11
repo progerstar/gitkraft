@@ -965,6 +965,7 @@ mod tests {
     #[test]
     fn comma_on_main_screen_queues_settings_open() {
         let mut app = App::new();
+        app.editor = gitkraft_core::Editor::None; // never launch the user's editor
         app.screen = AppScreen::Main;
         // No editor configured — open_settings_in_editor falls through to
         // the GUI-editor / system-default branch, which is fine for testing
@@ -982,6 +983,7 @@ mod tests {
     #[test]
     fn comma_on_welcome_screen_queues_settings_open() {
         let mut app = App::new();
+        app.editor = gitkraft_core::Editor::None; // never launch the user's editor
         // Welcome screen is the default.
         assert_eq!(app.screen, AppScreen::Welcome);
         handle_key(&mut app, key(KeyCode::Char(',')));
@@ -994,6 +996,7 @@ mod tests {
     #[test]
     fn comma_while_options_panel_open_closes_panel_and_opens_settings() {
         let mut app = App::new();
+        app.editor = gitkraft_core::Editor::None; // never launch the user's editor
         app.screen = AppScreen::Main;
         app.show_options_panel = true;
         handle_key(&mut app, key(KeyCode::Char(',')));

@@ -22,6 +22,7 @@ fn all_editors() -> Vec<gitkraft_core::Editor> {
         Editor::VSCode,
         Editor::Zed,
         Editor::Sublime,
+        Editor::LiteXl,
         Editor::RustRover,
         Editor::IntelliJIdea,
         Editor::WebStorm,

@@ -97,6 +97,10 @@ pub enum Message {
     CommitLogScrolled(f32, f32),
     /// The diff viewer scrollable was scrolled — carries `absolute_y`.
     DiffViewScrolled(f32),
+    /// Before/after images for an image diff were loaded.
+    ImagePreviewLoaded(crate::features::diff::image_view::ImagePreview),
+    /// Switch SVG diffs between rendered images and text.
+    ToggleSvgText,
     /// A lazy-loaded page of additional commits was fetched from the background.
     MoreCommitsLoaded(Result<CommitPage, String>),
 
@@ -111,6 +115,8 @@ pub enum Message {
     UnstageAll,
     /// Discard working-directory changes for a file.
     DiscardFile(String),
+    /// Ask before discarding a file's working-tree changes (shows a banner).
+    AskDiscard(String),
     /// User confirmed the discard for a file.
     ConfirmDiscard(String),
     /// User cancelled a pending discard.
@@ -137,6 +143,30 @@ pub enum Message {
     CreateCommit,
     /// Async commit creation completed.
     CommitCreated(Result<(), String>),
+    /// User edited the multi-line commit description.
+    CommitDescriptionAction(iced::widget::text_editor::Action),
+    /// User clicked the AI button: generate a message from the staged diff.
+    GenerateCommitMessage,
+    /// AI message generation finished for the repo at this path.
+    CommitMessageGenerated(PathBuf, Result<String, String>),
+    /// User toggled the "Push after commit" checkbox.
+    TogglePushAfterCommit(bool),
+    /// Background save of the "Push after commit" setting completed.
+    PushAfterCommitSaved(Result<(), String>),
+
+    // ── GitHub Desktop layout (fork) ──────────────────────────────────────
+    /// Switch between the Classic and GitHub Desktop layouts.
+    ToggleLayoutStyle,
+    /// Background save of the layout style completed.
+    LayoutStyleSaved(Result<(), String>),
+    /// Show the Changes or History tab of the left column.
+    SetGhdTab(crate::state::GhdTab),
+    /// Open / close the "Current branch" dropdown.
+    ToggleBranchPopup,
+    /// Close the "Current branch" dropdown.
+    CloseBranchPopup,
+    /// Time for a background fetch of every open repository with a remote.
+    AutoFetchTick,
 
     // ── Stash ─────────────────────────────────────────────────────────────
     /// Save the current working state as a stash.
@@ -247,6 +277,13 @@ pub enum Message {
 
     /// Pull the current branch from its remote, rebasing local commits on top.
     PullBranch(String),
+
+    /// Pull the current branch from its upstream, merging (or rebasing when
+    /// git's `pull.rebase` says so) — the toolbar "Pull" button.
+    PullMerge,
+
+    /// Merge a remote branch (e.g. `origin/main`) into the current branch.
+    MergeRemoteBranch(String),
 
     /// Rebase the current HEAD onto `target` (a branch name or OID string).
     RebaseOnto(String),

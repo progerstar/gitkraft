@@ -66,6 +66,16 @@ pub struct AppSettings {
     /// Index of the active tab within open_tabs.
     #[serde(default)]
     pub active_tab_index: usize,
+    /// Shell command that turns a staged diff (on stdin) into a commit message
+    /// (on stdout). `None` uses [`crate::DEFAULT_COMMIT_MESSAGE_COMMAND`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message_command: Option<String>,
+    /// Push the current branch right after a successful commit (GUI checkbox).
+    #[serde(default)]
+    pub push_after_commit: bool,
+    /// GUI layout: `"classic"` or `"two-pane"` (the default when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_style: Option<String>,
 }
 
 fn default_max_recent() -> usize {
@@ -83,6 +93,9 @@ impl Default for AppSettings {
             editor_name: None,
             open_tabs: Vec::new(),
             active_tab_index: 0,
+            commit_message_command: None,
+            push_after_commit: false,
+            layout_style: None,
         }
     }
 }
@@ -157,10 +170,10 @@ mod theme_tests {
     #[test]
     fn theme_index_resolves_known_and_unknown() {
         let mut s = AppSettings {
-            theme_name: Some("Dracula".to_string()),
+            theme_name: Some("Desk Light".to_string()),
             ..Default::default()
         };
-        assert_eq!(s.theme_index(), 9);
+        assert_eq!(s.theme_index(), 3);
         s.theme_name = Some("Not A Real Theme".to_string());
         assert_eq!(s.theme_index(), 0);
         assert!(!s.follow_system_theme());

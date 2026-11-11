@@ -58,8 +58,10 @@ fn main() -> iced::Result {
                     if modifiers.control() || modifiers.command() {
                         return handle_key_press(key, modifiers);
                     }
-                    // Always handle Shift+arrow shortcuts for range selection.
+                    // Handle Shift+arrow shortcuts for range selection, unless a
+                    // widget used the key (selecting text in the commit description).
                     if modifiers.shift()
+                        && !matches!(status, iced::event::Status::Captured)
                         && matches!(
                             key,
                             iced::keyboard::Key::Named(
@@ -83,9 +85,18 @@ fn main() -> iced::Result {
             // as the existing git-watcher and former auto-refresh streams).
             // Only active while at least one tab is loading to avoid CPU waste
             // at rest.
-            let any_loading = state.tabs.iter().any(|t| t.is_loading);
+            let any_loading = state
+                .tabs
+                .iter()
+                .any(|t| t.is_loading || t.generating_commit_message);
             let animation_ticker = if any_loading {
                 iced::Subscription::run(animation_tick_stream)
+            } else {
+                iced::Subscription::none()
+            };
+            // Background fetch while any open repo has a remote.
+            let auto_fetch = if state.tabs.iter().any(|t| !t.remotes.is_empty()) {
+                iced::Subscription::run(auto_fetch_stream)
             } else {
                 iced::Subscription::none()
             };
@@ -94,7 +105,13 @@ fn main() -> iced::Result {
             } else {
                 iced::Subscription::none()
             };
-            iced::Subscription::batch([keyboard, git_watcher, animation_ticker, system_theme])
+            iced::Subscription::batch([
+                keyboard,
+                git_watcher,
+                animation_ticker,
+                system_theme,
+                auto_fetch,
+            ])
         })
         .scale_factor(|state: &GitKraft| state.ui_scale)
         .settings(Settings {
@@ -209,6 +226,16 @@ fn animation_tick_stream() -> impl futures::Stream<Item = gitkraft_gui::Message>
         // Subscription on its own thread-pool worker.
         std::thread::sleep(std::time::Duration::from_millis(100));
         Some((gitkraft_gui::Message::AnimationTick, ()))
+    })
+}
+
+/// Emits [`gitkraft_gui::Message::AutoFetchTick`] 10 s after it starts, then
+/// every 5 minutes (blocking sleep on its own worker, like the other streams).
+fn auto_fetch_stream() -> impl futures::Stream<Item = gitkraft_gui::Message> {
+    futures::stream::unfold(true, |first| async move {
+        let wait = if first { 10 } else { 300 };
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+        Some((gitkraft_gui::Message::AutoFetchTick, false))
     })
 }
 

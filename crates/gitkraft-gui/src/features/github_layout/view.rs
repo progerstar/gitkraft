@@ -107,6 +107,11 @@ fn checkbox_icon<'a>(inclusion: Inclusion, c: &ThemeColors) -> Element<'a, Messa
     icon!(glyph, 14, color).into()
 }
 
+/// Scrollable id of the Changes list in the given tab.
+pub(crate) fn changes_list_scroll_id(tab_index: usize) -> iced::widget::Id {
+    iced::widget::Id::from(format!("changes_list_{tab_index}"))
+}
+
 /// Header with a select-all checkbox, then one row per changed file.
 fn changes_list<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message> {
     let tab = state.active_tab();
@@ -253,6 +258,8 @@ fn changes_list<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message
     column![
         header,
         scrollable(list)
+            .id(changes_list_scroll_id(state.active_tab))
+            .on_scroll(Message::ChangesListScrolled)
             .height(Length::Fill)
             .direction(view_utils::thin_scrollbar())
             .style(theme::overlay_scrollbar),

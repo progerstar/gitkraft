@@ -133,10 +133,36 @@ impl ChangesSelection {
         self.cursor = Some(path.to_string());
     }
 
+    /// Up / Down: move the cursor by `delta` rows and select only that row.
+    /// Without a cursor, start at the first (down) or last (up) row. At either
+    /// end a multi-row selection still collapses to the cursor row. Returns the
+    /// cursor path when the selection changed.
+    pub(crate) fn step(&mut self, rows: &[String], delta: isize) -> Option<String> {
+        let (current, target) = self.cursor_target(rows, delta)?;
+        let path = &rows[target];
+        let unchanged = current == Some(target) && self.paths.len() == 1 && self.contains(path);
+        self.click(rows, path, ClickKind::Single);
+        (!unchanged).then(|| path.clone())
+    }
+
     /// Shift+arrow: move the cursor by `delta` rows and select from the anchor
     /// to it. Without a cursor, start at the first (down) or last (up) row.
     /// Returns the new cursor path when it moved.
     pub(crate) fn extend(&mut self, rows: &[String], delta: isize) -> Option<String> {
+        let (current, target) = self.cursor_target(rows, delta)?;
+        if current == Some(target) {
+            return None;
+        }
+        if current.is_none() {
+            self.anchor = None;
+        }
+        self.select_range_to(rows, target);
+        self.cursor.clone()
+    }
+
+    /// The cursor's row and the row `delta` away from it (clamped to the
+    /// list); without a cursor, the first (down) or last (up) row.
+    fn cursor_target(&self, rows: &[String], delta: isize) -> Option<(Option<usize>, usize)> {
         if rows.is_empty() {
             return None;
         }
@@ -149,14 +175,7 @@ impl ChangesSelection {
             None if delta < 0 => rows.len() - 1,
             None => 0,
         };
-        if current == Some(target) {
-            return None;
-        }
-        if current.is_none() {
-            self.anchor = None;
-        }
-        self.select_range_to(rows, target);
-        self.cursor.clone()
+        Some((current, target))
     }
 
     /// Select the rows between the anchor and `target` (inclusive) and put the
@@ -183,6 +202,49 @@ impl ChangesSelection {
         }
         if self.cursor.as_deref().is_some_and(|c| !rows.contains(c)) {
             self.cursor = None;
+        }
+    }
+}
+
+/// The visible part of the Changes list, as last reported by its scrollable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListViewport {
+    /// How far the list is scrolled down.
+    pub offset: f32,
+    /// Height of the visible part.
+    pub height: f32,
+    /// Height of all the rows together.
+    pub content_height: f32,
+}
+
+impl From<iced::widget::scrollable::Viewport> for ListViewport {
+    fn from(vp: iced::widget::scrollable::Viewport) -> Self {
+        Self {
+            offset: vp.absolute_offset().y,
+            height: vp.bounds().height,
+            content_height: vp.content_bounds().height,
+        }
+    }
+}
+
+impl ListViewport {
+    /// The offset that brings row `index` of `count` fully into view (just
+    /// enough to show it), or `None` when it is visible already. The rows are
+    /// taken to be the same height; the spacing between them is under a pixel
+    /// off per row.
+    pub(crate) fn reveal(&self, index: usize, count: usize) -> Option<f32> {
+        if count == 0 {
+            return None;
+        }
+        let row = self.content_height / count as f32;
+        let top = index as f32 * row;
+        let bottom = top + row;
+        if top < self.offset {
+            Some(top)
+        } else if bottom > self.offset + self.height {
+            Some(bottom - self.height)
+        } else {
+            None
         }
     }
 }
@@ -291,6 +353,60 @@ mod tests {
         assert_eq!(selected(&sel), ["c"]);
 
         assert_eq!(ChangesSelection::default().extend(&[], 1), None);
+    }
+
+    #[test]
+    fn arrows_move_a_single_row_selection() {
+        let rows = rows(&["a", "b", "c"]);
+        let mut sel = ChangesSelection::default();
+        // Without a cursor, Down starts at the top and Up at the bottom.
+        assert_eq!(sel.step(&rows, 1).as_deref(), Some("a"));
+        assert_eq!(sel.step(&rows, 1).as_deref(), Some("b"));
+        assert_eq!(selected(&sel), ["b"]);
+        assert_eq!(sel.anchor.as_deref(), Some("b"));
+        assert_eq!(sel.step(&rows, -1).as_deref(), Some("a"));
+        // Clamped at the top.
+        assert_eq!(sel.step(&rows, -1), None);
+        assert_eq!(selected(&sel), ["a"]);
+
+        let mut sel = ChangesSelection::default();
+        assert_eq!(sel.step(&rows, -1).as_deref(), Some("c"));
+        assert_eq!(ChangesSelection::default().step(&[], 1), None);
+    }
+
+    #[test]
+    fn arrows_collapse_a_range_to_the_next_row_or_the_cursor_at_an_end() {
+        let rows = rows(&["a", "b", "c", "d"]);
+        let mut sel = ChangesSelection::default();
+        sel.click(&rows, "a", ClickKind::Single);
+        sel.click(&rows, "c", ClickKind::Range);
+        assert_eq!(sel.step(&rows, 1).as_deref(), Some("d"));
+        assert_eq!(selected(&sel), ["d"]);
+        // Shift+arrows then range from the row reached.
+        sel.extend(&rows, -1);
+        assert_eq!(selected(&sel), ["c", "d"]);
+
+        sel.click(&rows, "b", ClickKind::Range);
+        sel.click(&rows, "d", ClickKind::Toggle);
+        assert_eq!(selected(&sel), ["b", "c"]);
+        // The cursor is on the last row: Down keeps it there, selected alone.
+        assert_eq!(sel.step(&rows, 1).as_deref(), Some("d"));
+        assert_eq!(selected(&sel), ["d"]);
+    }
+
+    #[test]
+    fn reveal_scrolls_just_enough_to_show_the_row() {
+        // 10 rows of 20 px, 60 px of them visible from 100 (rows 5 to 7).
+        let vp = ListViewport {
+            offset: 100.0,
+            height: 60.0,
+            content_height: 200.0,
+        };
+        assert_eq!(vp.reveal(5, 10), None);
+        assert_eq!(vp.reveal(7, 10), None);
+        assert_eq!(vp.reveal(4, 10), Some(80.0));
+        assert_eq!(vp.reveal(8, 10), Some(120.0));
+        assert_eq!(vp.reveal(0, 0), None);
     }
 
     #[test]

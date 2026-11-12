@@ -171,6 +171,8 @@ pub enum Message {
     /// Space: stage the selected Changes rows, or unstage them when all of
     /// them are fully staged.
     ToggleSelectedChangesStaged,
+    /// The Changes list was scrolled or resized.
+    ChangesListScrolled(iced::widget::scrollable::Viewport),
     /// Time for a background fetch of every open repository with a remote.
     AutoFetchTick,
     /// A background fetch of the repository at the path finished (with the
@@ -504,6 +506,10 @@ pub enum Message {
     ShiftArrowDown,
     /// Shift+Up arrow — same as above but upward.
     ShiftArrowUp,
+    /// Down arrow — selects the next row of the Changes list.
+    ArrowDown,
+    /// Up arrow — selects the previous row of the Changes list.
+    ArrowUp,
 
     /// Jump to the first (newest) commit in the log.
     JumpToFirstCommit,

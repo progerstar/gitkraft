@@ -194,6 +194,9 @@ pub struct RepoTab {
     pub anchor_staged_index: Option<usize>,
     /// Selection in the Changes list of the GitHub Desktop layout.
     pub changes_selection: crate::features::github_layout::changes::ChangesSelection,
+    /// Visible part of the Changes list, to keep the row reached with the
+    /// arrow keys on screen (`None` until the list first overflows).
+    pub changes_list_viewport: Option<crate::features::github_layout::changes::ListViewport>,
 
     /// File path pending discard confirmation (None = no pending discard).
     pub pending_discard: Option<String>,
@@ -329,6 +332,7 @@ impl RepoTab {
             anchor_unstaged_index: None,
             anchor_staged_index: None,
             changes_selection: Default::default(),
+            changes_list_viewport: None,
             pending_discard: None,
             status_message: None,
             error_message: None,

@@ -87,6 +87,14 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
 
         Message::ToggleSelectedChangesStaged => toggle_selected_staged(state),
 
+        Message::ArrowDown => step_changes_selection(state, |sel, rows| sel.step(rows, 1)),
+        Message::ArrowUp => step_changes_selection(state, |sel, rows| sel.step(rows, -1)),
+
+        Message::ChangesListScrolled(viewport) => {
+            state.active_tab_mut().changes_list_viewport = Some(viewport.into());
+            Task::none()
+        }
+
         _ => Task::none(),
     }
 }
@@ -110,15 +118,40 @@ fn changes_keys_active(state: &GitKraft) -> bool {
 /// Shift+Up / Shift+Down in the Changes list: grow or shrink the range from
 /// the anchor and show the diff of the row reached.
 pub(crate) fn extend_changes_selection(state: &mut GitKraft, delta: isize) -> Task<Message> {
+    step_changes_selection(state, |sel, rows| sel.extend(rows, delta))
+}
+
+/// An arrow key in the Changes list: `step` moves the selection over the
+/// rows and returns the row reached, whose diff is then shown and which is
+/// scrolled into view.
+fn step_changes_selection(
+    state: &mut GitKraft,
+    step: impl FnOnce(&mut changes::ChangesSelection, &[String]) -> Option<String>,
+) -> Task<Message> {
     if !changes_keys_active(state) {
         return Task::none();
     }
+    let tab_index = state.active_tab;
     let tab = state.active_tab_mut();
     let rows = changes::changed_paths(tab);
-    match tab.changes_selection.extend(&rows, delta) {
-        Some(path) => show_change(state, path),
-        None => Task::none(),
-    }
+    let Some(path) = step(&mut tab.changes_selection, &rows) else {
+        return Task::none();
+    };
+    let reveal = rows
+        .iter()
+        .position(|r| *r == path)
+        .and_then(|index| {
+            let viewport = tab.changes_list_viewport.as_mut()?;
+            let offset = viewport.reveal(index, rows.len())?;
+            // Several keys can arrive before the next scroll report.
+            viewport.offset = offset;
+            Some(iced::widget::operation::scroll_to(
+                super::view::changes_list_scroll_id(tab_index),
+                iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
+            ))
+        })
+        .unwrap_or_else(Task::none);
+    Task::batch([show_change(state, path), reveal])
 }
 
 /// Space in the Changes list: stage every selected row, or unstage them all
@@ -276,6 +309,48 @@ mod tests {
         let _ = state.update(Message::ShiftArrowUp);
         assert_eq!(selected(&state), ["b", "c"]);
         assert_eq!(state.active_tab().selected_commit, None);
+    }
+
+    #[test]
+    fn arrows_move_through_the_changes_list_and_keep_the_row_in_view() {
+        let mut state = state_with_changes();
+        // Rows of 20 px, two of them visible: a and b.
+        state.active_tab_mut().changes_list_viewport = Some(changes::ListViewport {
+            offset: 0.0,
+            height: 40.0,
+            content_height: 80.0,
+        });
+        let _ = state.update(Message::ArrowDown);
+        let _ = state.update(Message::ArrowDown);
+        assert_eq!(selected(&state), ["b"]);
+        assert_eq!(
+            state.active_tab().changes_list_viewport.unwrap().offset,
+            0.0
+        );
+        let _ = state.update(Message::ArrowDown);
+        assert_eq!(selected(&state), ["c"]);
+        assert_eq!(
+            state.active_tab().changes_list_viewport.unwrap().offset,
+            20.0
+        );
+        let _ = state.update(Message::ArrowUp);
+        let _ = state.update(Message::ArrowUp);
+        assert_eq!(selected(&state), ["a"]);
+        assert_eq!(
+            state.active_tab().changes_list_viewport.unwrap().offset,
+            0.0
+        );
+    }
+
+    #[test]
+    fn arrows_do_nothing_outside_the_changes_list() {
+        let mut state = state_with_changes();
+        state.ghd_tab = GhdTab::History;
+        let _ = state.update(Message::ArrowDown);
+        state.ghd_tab = GhdTab::Changes;
+        state.branch_popup_open = true;
+        let _ = state.update(Message::ArrowDown);
+        assert!(selected(&state).is_empty());
     }
 
     #[test]

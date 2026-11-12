@@ -1042,9 +1042,10 @@ impl GitKraft {
             | Message::ToggleBranchPopup
             | Message::CloseBranchPopup
             | Message::SelectChange(_)
-            | Message::ToggleSelectedChangesStaged => {
-                crate::features::github_layout::update::update(self, message)
-            }
+            | Message::ToggleSelectedChangesStaged
+            | Message::ChangesListScrolled(_)
+            | Message::ArrowDown
+            | Message::ArrowUp => crate::features::github_layout::update::update(self, message),
 
             Message::EditorChanged(editor) => {
                 self.editor = editor.clone();

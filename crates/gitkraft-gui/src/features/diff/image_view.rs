@@ -128,13 +128,21 @@ pub(crate) fn view<'a>(
                 .color(c.red),
         ),
         Some(Ok(pair)) => {
-            let before = side_panel("Before", pair.old.as_ref(), c, c.red, status);
-            let after = side_panel("After", pair.new.as_ref(), c, c.green, status);
-            row![before, after]
-                .spacing(12)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+            // An added file has no "before" and a deleted one no "after":
+            // show only the side that exists.
+            let (show_before, show_after) = match status {
+                FileStatus::New | FileStatus::Untracked => (false, true),
+                FileStatus::Deleted => (true, false),
+                _ => (true, true),
+            };
+            let mut sides = row![].spacing(12).width(Length::Fill).height(Length::Fill);
+            if show_before {
+                sides = sides.push(side_panel("Before", pair.old.as_ref(), c, c.red));
+            }
+            if show_after {
+                sides = sides.push(side_panel("After", pair.new.as_ref(), c, c.green));
+            }
+            sides.into()
         }
     };
     container(body)
@@ -158,7 +166,6 @@ fn side_panel<'a>(
     side: Option<&'a ImageSide>,
     c: &ThemeColors,
     accent: iced::Color,
-    status: &FileStatus,
 ) -> Element<'a, Message> {
     let info = match side {
         Some(s) => {
@@ -209,14 +216,7 @@ fn side_panel<'a>(
             .height(Length::Fill)
             .into()
         }
-        None => {
-            let note = match status {
-                FileStatus::New | FileStatus::Untracked => "File added",
-                FileStatus::Deleted => "File deleted",
-                _ => "No image",
-            };
-            centered(text(note).size(12).color(c.muted))
-        }
+        None => centered(text("No image").size(12).color(c.muted)),
     };
 
     column![

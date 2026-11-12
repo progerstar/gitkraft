@@ -307,6 +307,8 @@ fn handle_key_press(
             }
             // F5 — refresh
             Key::Named(iced::keyboard::key::Named::F5) => Some(gitkraft_gui::Message::RefreshRepo),
+            // Space — stage / unstage the files selected in the Changes list
+            Key::Named(Named::Space) => Some(gitkraft_gui::Message::ToggleSelectedChangesStaged),
             _ => None,
         }
     }

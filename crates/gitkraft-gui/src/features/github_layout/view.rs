@@ -2,11 +2,10 @@
 //! tabs (changed files with checkboxes and the commit box, or the commit log)
 //! next to the diff, and branches / stashes / remotes in a dropdown.
 
-use std::collections::{BTreeMap, HashSet};
-
 use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Alignment, Element, Font, Length};
 
+use super::changes::{Inclusion, changed_files};
 use crate::icons;
 use crate::message::Message;
 use crate::state::{DragTarget, GhdTab, GitKraft};
@@ -59,7 +58,7 @@ pub(crate) fn body<'a>(
 
 /// "Changes (n) | History" tab strip.
 fn tabs<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message> {
-    let count = changed_files(state).len();
+    let count = changed_files(state.active_tab()).len();
     let tab = |label: String, which: GhdTab| -> Element<'a, Message> {
         let active = state.ghd_tab == which;
         let label = text(label)
@@ -98,52 +97,6 @@ fn tabs<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message> {
     .into()
 }
 
-/// How much of a file's change is staged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Inclusion {
-    None,
-    Partial,
-    All,
-}
-
-/// One row of the Changes list.
-#[derive(Debug, Clone)]
-struct ChangedFile<'a> {
-    entry: &'a gitkraft_core::DiffFileEntry,
-    inclusion: Inclusion,
-}
-
-/// Unstaged and staged entries merged by path, sorted by path.
-fn changed_files(state: &GitKraft) -> Vec<ChangedFile<'_>> {
-    let tab = state.active_tab();
-    let staged: HashSet<&str> = tab
-        .staged_changes
-        .iter()
-        .map(|f| f.display_path())
-        .collect();
-    let unstaged: HashSet<&str> = tab
-        .unstaged_changes
-        .iter()
-        .map(|f| f.display_path())
-        .collect();
-
-    let mut by_path: BTreeMap<&str, ChangedFile<'_>> = BTreeMap::new();
-    // The working-tree entry describes the whole change best; fall back to
-    // the staged one for fully staged files.
-    for entry in tab.unstaged_changes.iter().chain(&tab.staged_changes) {
-        let path = entry.display_path();
-        let inclusion = match (staged.contains(path), unstaged.contains(path)) {
-            (true, false) => Inclusion::All,
-            (true, true) => Inclusion::Partial,
-            _ => Inclusion::None,
-        };
-        by_path
-            .entry(path)
-            .or_insert(ChangedFile { entry, inclusion });
-    }
-    by_path.into_values().collect()
-}
-
 /// Checkbox glyph for an inclusion state.
 fn checkbox_icon<'a>(inclusion: Inclusion, c: &ThemeColors) -> Element<'a, Message> {
     let (glyph, color) = match inclusion {
@@ -157,7 +110,7 @@ fn checkbox_icon<'a>(inclusion: Inclusion, c: &ThemeColors) -> Element<'a, Messa
 /// Header with a select-all checkbox, then one row per changed file.
 fn changes_list<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message> {
     let tab = state.active_tab();
-    let files = changed_files(state);
+    let files = changed_files(tab);
 
     let all = if files.is_empty() || files.iter().all(|f| f.inclusion == Inclusion::None) {
         Inclusion::None
@@ -201,8 +154,10 @@ fn changes_list<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message
     .align_y(Alignment::Center)
     .padding([6, 8]);
 
-    // Highlight the file whose working-tree diff is on the right.
-    let shown_path = (tab.selected_commit_oid.is_none())
+    // Highlight the selected rows; with none, the file whose diff is shown
+    // (opened from its context menu).
+    let selection = &tab.changes_selection;
+    let shown_path = (tab.selected_commit_oid.is_none() && selection.paths.is_empty())
         .then(|| tab.selected_diff.as_ref().map(|d| d.display_path()))
         .flatten();
 
@@ -281,18 +236,16 @@ fn changes_list<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Message
         .align_y(Alignment::Center)
         .padding([2, 8]);
 
-        // Show the unstaged diff when there is one (it is what changed in the
-        // working tree); a fully staged file shows its staged diff.
-        let show_staged = file.inclusion == Inclusion::All;
-        let context_menu = if show_staged {
+        let context_menu = if file.shows_staged() {
             Message::OpenStagedFileContextMenu(path.to_string())
         } else {
             Message::OpenUnstagedFileContextMenu(path.to_string())
         };
-        let style = row_style!(shown_path == Some(path) => theme::selected_row_style);
+        let selected = selection.contains(path) || shown_path == Some(path);
+        let style = row_style!(selected => theme::selected_row_style);
         list = list.push(
             mouse_area(container(line).width(Length::Fill).style(style))
-                .on_press(Message::LoadStagingFileDiff(path.to_string(), show_staged))
+                .on_press(Message::SelectChange(path.to_string()))
                 .on_right_press(context_menu),
         );
     }
@@ -415,11 +368,8 @@ mod tests {
             entry("a.rs", FileStatus::New),
             entry("b.rs", FileStatus::Modified),
         ];
-        let files = changed_files(&state);
-        let got: Vec<(&str, Inclusion)> = files
-            .iter()
-            .map(|f| (f.entry.display_path(), f.inclusion))
-            .collect();
+        let files = changed_files(state.active_tab());
+        let got: Vec<(&str, Inclusion)> = files.iter().map(|f| (f.path(), f.inclusion)).collect();
         assert_eq!(
             got,
             vec![

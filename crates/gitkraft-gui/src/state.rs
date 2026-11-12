@@ -192,6 +192,8 @@ pub struct RepoTab {
     pub anchor_unstaged_index: Option<usize>,
     /// Anchor index for Shift+Click range selection in the staged list.
     pub anchor_staged_index: Option<usize>,
+    /// Selection in the Changes list of the GitHub Desktop layout.
+    pub changes_selection: crate::features::github_layout::changes::ChangesSelection,
 
     /// File path pending discard confirmation (None = no pending discard).
     pub pending_discard: Option<String>,
@@ -326,6 +328,7 @@ impl RepoTab {
             selected_staged: std::collections::HashSet::new(),
             anchor_unstaged_index: None,
             anchor_staged_index: None,
+            changes_selection: Default::default(),
             pending_discard: None,
             status_message: None,
             error_message: None,
@@ -566,6 +569,7 @@ impl RepoTab {
         self.anchor_unstaged_index =
             prev_anchor_unstaged.filter(|&i| i < self.unstaged_changes.len());
         self.anchor_staged_index = prev_anchor_staged.filter(|&i| i < self.staged_changes.len());
+        self.prune_changes_selection();
     }
 
     /// Clear all diff-related state (used when the selected commit disappears
@@ -2224,6 +2228,8 @@ mod tests {
     fn shift_arrow_down_extends_file_list_selection_when_files_loaded() {
         use crate::message::Message;
         let mut state = GitKraft::new();
+        // The commit log and its file list live in the History tab.
+        state.ghd_tab = GhdTab::History;
         state.active_tab_mut().repo_path =
             Some(std::path::PathBuf::from("/tmp/fake-repo-for-test"));
         state.active_tab_mut().commit_files = make_commit_files(&["a.rs", "b.rs", "c.rs"]);
@@ -2244,6 +2250,8 @@ mod tests {
     fn shift_arrow_down_falls_through_to_commit_log_when_no_files() {
         use crate::message::Message;
         let mut state = GitKraft::new();
+        // The commit log and its file list live in the History tab.
+        state.ghd_tab = GhdTab::History;
         state.active_tab_mut().commits = make_test_commits(5);
         state.active_tab_mut().selected_commit = Some(1);
         state.active_tab_mut().anchor_commit_index = Some(1);

@@ -165,6 +165,12 @@ pub enum Message {
     ToggleBranchPopup,
     /// Close the "Current branch" dropdown.
     CloseBranchPopup,
+    /// A row of the Changes list was clicked: select it, extend the range to
+    /// it (Shift) or toggle it (Ctrl / Cmd), and show its diff.
+    SelectChange(String),
+    /// Space: stage the selected Changes rows, or unstage them when all of
+    /// them are fully staged.
+    ToggleSelectedChangesStaged,
     /// Time for a background fetch of every open repository with a remote.
     AutoFetchTick,
     /// A background fetch of the repository at the path finished (with the

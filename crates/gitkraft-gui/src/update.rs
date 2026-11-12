@@ -219,6 +219,17 @@ impl GitKraft {
                 Task::none()
             }
 
+            Message::ShiftArrowDown | Message::ShiftArrowUp
+                if crate::features::github_layout::update::changes_list_shown(self) =>
+            {
+                let delta = if matches!(message, Message::ShiftArrowDown) {
+                    1
+                } else {
+                    -1
+                };
+                crate::features::github_layout::update::extend_changes_selection(self, delta)
+            }
+
             Message::ShiftArrowDown => {
                 // Priority 1: file list (if commit files are loaded and a file is selected).
                 let file_info: Option<(usize, usize)> = {
@@ -1029,7 +1040,9 @@ impl GitKraft {
             Message::ToggleLayoutStyle
             | Message::SetGhdTab(_)
             | Message::ToggleBranchPopup
-            | Message::CloseBranchPopup => {
+            | Message::CloseBranchPopup
+            | Message::SelectChange(_)
+            | Message::ToggleSelectedChangesStaged => {
                 crate::features::github_layout::update::update(self, message)
             }
 

@@ -120,6 +120,7 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
                 Ok(payload) => {
                     tab.unstaged_changes = payload.unstaged;
                     tab.staged_changes = payload.staged;
+                    tab.prune_changes_selection();
                     tab.status_message = Some("Staging area updated.".into());
                 }
                 Err(e) => {

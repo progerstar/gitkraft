@@ -9,11 +9,12 @@ use super::types::{DiffFileEntry, DiffHunk, DiffInfo, DiffLine, FileStatus};
 
 /// Return the diff of unstaged (working-directory) changes against the index.
 ///
-/// Includes untracked files.
+/// Includes untracked files, with their content shown as all-added lines.
 pub fn get_working_dir_diff(repo: &Repository) -> Result<Vec<DiffInfo>> {
     let mut opts = DiffOptions::new();
-    opts.include_untracked(true);
-    opts.recurse_untracked_dirs(true);
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
 
     let diff = repo
         .diff_index_to_workdir(None, Some(&mut opts))
@@ -57,20 +58,41 @@ pub fn get_working_dir_file_list(repo: &Repository) -> Result<Vec<DiffFileEntry>
 
 /// Return the full diff (with hunks/lines) for a **single unstaged file**.
 ///
-/// Uses pathspec filtering so only the requested file is parsed.
+/// Uses pathspec filtering so only the requested file is parsed.  An
+/// untracked file's content is shown as all-added lines.
 pub fn get_working_dir_single_file_diff(repo: &Repository, file_path: &str) -> Result<DiffInfo> {
     let mut opts = DiffOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
         .pathspec(file_path);
     let diff = repo
         .diff_index_to_workdir(None, Some(&mut opts))
         .context("failed to diff index to workdir for single file")?;
-    let infos = parse_diff(&diff)?;
-    infos
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("file '{}' not found in working-dir diff", file_path))
+    if let Some(info) = parse_diff(&diff)?.into_iter().next() {
+        return Ok(info);
+    }
+
+    // libgit2 refuses to descend into an untracked-looking directory that
+    // contains a `.git` entry (e.g. a leftover empty `.git/` folder).  A
+    // narrow pathspec drops every tracked index entry under such a directory
+    // from the walk, so it looks untracked and an untracked file inside it
+    // vanishes — even though the unfiltered listing
+    // ([`get_working_dir_file_list`]) shows it.  Retry with the same
+    // unfiltered view and build the patch for the requested file only.
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = repo
+        .diff_index_to_workdir(None, Some(&mut opts))
+        .context("failed to diff index to workdir")?;
+    let wanted = std::path::Path::new(file_path);
+    let idx = diff
+        .deltas()
+        .position(|d| d.new_file().path() == Some(wanted) || d.old_file().path() == Some(wanted))
+        .ok_or_else(|| anyhow::anyhow!("file '{}' not found in working-dir diff", file_path))?;
+    delta_diff_info(&diff, idx)
 }
 
 /// Return the full diff (with hunks/lines) for a **single staged file**.
@@ -407,40 +429,96 @@ fn diff_file_entries(diff: &Diff<'_>) -> Vec<DiffFileEntry> {
         .collect()
 }
 
+/// Maximum number of diff lines to store per file.
+/// Beyond this, additional lines are silently dropped to prevent
+/// multi-GB memory consumption from huge generated/binary diffs.
+const MAX_LINES_PER_FILE: usize = 10_000;
+
+/// A `DiffInfo` with paths, status and blob ids from `delta`, but no hunks.
+fn delta_shell(delta: &git2::DiffDelta<'_>) -> DiffInfo {
+    let path_of = |f: git2::DiffFile<'_>| {
+        f.path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    DiffInfo {
+        old_file: path_of(delta.old_file()),
+        new_file: path_of(delta.new_file()),
+        status: FileStatus::from_delta(delta.status()),
+        hunks: Vec::new(),
+        old_id: blob_id(delta.old_file().id()),
+        new_id: blob_id(delta.new_file().id()),
+    }
+}
+
+/// Hunk header text as shown in the UI (trailing newline trimmed).
+fn hunk_header_text(hunk: &git2::DiffHunk<'_>) -> String {
+    String::from_utf8_lossy(hunk.header())
+        .trim_end()
+        .to_string()
+}
+
+/// Map a git2 content line to our `DiffLine`; `None` for informational
+/// origins (file headers `F`, binary notices `B`, hunk headers `H`).
+fn convert_line(line: &git2::DiffLine<'_>) -> Option<DiffLine> {
+    let content = String::from_utf8_lossy(line.content())
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string();
+    match line.origin() {
+        '+' | '>' => Some(DiffLine::Addition(content)),
+        '-' | '<' => Some(DiffLine::Deletion(content)),
+        ' ' => Some(DiffLine::Context(content)),
+        _ => None,
+    }
+}
+
+/// Build the `DiffInfo` for delta `idx` of `diff`, generating hunks for that
+/// delta only.
+fn delta_diff_info(diff: &Diff<'_>, idx: usize) -> Result<DiffInfo> {
+    let delta = diff
+        .get_delta(idx)
+        .ok_or_else(|| anyhow::anyhow!("diff delta {idx} out of range"))?;
+    let mut info = delta_shell(&delta);
+
+    // `None` for binary or unchanged files — keep the hunk-less shell, as
+    // `parse_diff` does.
+    let Some(patch) = git2::Patch::from_diff(diff, idx).context("failed to build patch")? else {
+        return Ok(info);
+    };
+
+    let mut line_count = 0;
+    for h in 0..patch.num_hunks() {
+        if line_count >= MAX_LINES_PER_FILE {
+            break;
+        }
+        let (hunk, n_lines) = patch.hunk(h).context("failed to read hunk")?;
+        let header = hunk_header_text(&hunk);
+        let mut lines = vec![DiffLine::HunkHeader(header.clone())];
+        line_count += 1;
+        for l in 0..n_lines {
+            if line_count >= MAX_LINES_PER_FILE {
+                break;
+            }
+            let line = patch
+                .line_in_hunk(h, l)
+                .context("failed to read diff line")?;
+            if let Some(dl) = convert_line(&line) {
+                lines.push(dl);
+                line_count += 1;
+            }
+        }
+        info.hunks.push(DiffHunk { header, lines });
+    }
+    Ok(info)
+}
+
 /// Walk every delta / hunk / line in a `git2::Diff` and produce our domain
 /// `Vec<DiffInfo>`.
 fn parse_diff(diff: &Diff<'_>) -> Result<Vec<DiffInfo>> {
-    let num_deltas = diff.deltas().len();
-    let mut infos: Vec<DiffInfo> = Vec::with_capacity(num_deltas);
-
-    /// Maximum number of diff lines to store per file.
-    /// Beyond this, additional lines are silently dropped to prevent
-    /// multi-GB memory consumption from huge generated/binary diffs.
-    const MAX_LINES_PER_FILE: usize = 10_000;
-
     // Pre-populate DiffInfo shells for each delta so the print callback can
     // index into them.
-    for delta in diff.deltas() {
-        let old_file = delta
-            .old_file()
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let new_file = delta
-            .new_file()
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let status = FileStatus::from_delta(delta.status());
-        infos.push(DiffInfo {
-            old_file,
-            new_file,
-            status,
-            hunks: Vec::new(),
-            old_id: blob_id(delta.old_file().id()),
-            new_id: blob_id(delta.new_file().id()),
-        });
-    }
+    let mut infos: Vec<DiffInfo> = diff.deltas().map(|d| delta_shell(&d)).collect();
 
     // Walk through the diff with the print callback which gives us
     // file / hunk / line events in order.
@@ -493,9 +571,7 @@ fn parse_diff(diff: &Diff<'_>) -> Result<Vec<DiffInfo>> {
 
         // If we have a hunk header, potentially create a new hunk.
         if let Some(hunk) = maybe_hunk {
-            let header = String::from_utf8_lossy(hunk.header())
-                .trim_end()
-                .to_string();
+            let header = hunk_header_text(&hunk);
 
             // Only create a new hunk if the header differs from the current one.
             let needs_new = match info.hunks.last() {
@@ -512,20 +588,9 @@ fn parse_diff(diff: &Diff<'_>) -> Result<Vec<DiffInfo>> {
         }
 
         // Map the line origin to our DiffLine type and append to the current hunk.
-        if let Some(hunk) = info.hunks.last_mut() {
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end_matches('\n')
-                .trim_end_matches('\r')
-                .to_string();
-
-            let diff_line = match line.origin() {
-                '+' | '>' => DiffLine::Addition(content),
-                '-' | '<' => DiffLine::Deletion(content),
-                ' ' => DiffLine::Context(content),
-                // File-level headers ('F'), binary notices ('B'), hunk header origin ('H')
-                // — we skip these as they are handled above or are informational.
-                _ => return true,
-            };
+        if let Some(hunk) = info.hunks.last_mut()
+            && let Some(diff_line) = convert_line(&line)
+        {
             hunk.lines.push(diff_line);
             current_line_count += 1;
         }
@@ -819,6 +884,84 @@ mod tests {
             files.is_empty(),
             "unstaged changes should not appear in staged file list"
         );
+    }
+
+    #[test]
+    fn working_dir_single_file_diff_finds_untracked_file_under_stray_dot_git() {
+        // A leftover empty `.git/` folder makes libgit2 skip the directory
+        // once a narrow pathspec hides its tracked entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        fs::create_dir_all(tmp.path().join("sub/d")).unwrap();
+        fs::write(tmp.path().join("sub/d/usercode.lua"), "tracked\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new("sub/d/usercode.lua"))
+            .unwrap();
+        index.write().unwrap();
+        fs::create_dir_all(tmp.path().join("sub/.git")).unwrap();
+        fs::write(tmp.path().join("sub/d/usercode-x.lua"), "one\ntwo\n").unwrap();
+
+        let listed = get_working_dir_file_list(&repo).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.display_path() == "sub/d/usercode-x.lua")
+        );
+
+        let diff = get_working_dir_single_file_diff(&repo, "sub/d/usercode-x.lua").unwrap();
+        assert_eq!(diff.new_file, "sub/d/usercode-x.lua");
+        assert_eq!(diff.status, FileStatus::Untracked);
+        assert_eq!(added_lines(&diff), ["one", "two"]);
+    }
+
+    fn added_lines(diff: &DiffInfo) -> Vec<&str> {
+        diff.hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|l| match l {
+                DiffLine::Addition(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn working_dir_single_file_diff_shows_untracked_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        fs::write(tmp.path().join("new.txt"), "alpha\nbeta\n").unwrap();
+
+        let diff = get_working_dir_single_file_diff(&repo, "new.txt").unwrap();
+        assert_eq!(diff.status, FileStatus::Untracked);
+        assert_eq!(added_lines(&diff), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn delta_diff_info_matches_parse_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        fs::write(
+            tmp.path().join("hello.txt"),
+            "Hello, changed!\nsecond line\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("new.txt"), "brand new\n").unwrap();
+
+        // Fresh diff each time: printing a diff fills in workdir blob ids.
+        let fresh = || {
+            let mut opts = DiffOptions::new();
+            opts.include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .show_untracked_content(true);
+            repo.diff_index_to_workdir(None, Some(&mut opts)).unwrap()
+        };
+        let all = parse_diff(&fresh()).unwrap();
+        assert_eq!(all.len(), 2);
+        for (idx, expected) in all.iter().enumerate() {
+            let single = delta_diff_info(&fresh(), idx).unwrap();
+            assert_eq!(format!("{single:?}"), format!("{expected:?}"));
+        }
     }
 
     #[test]

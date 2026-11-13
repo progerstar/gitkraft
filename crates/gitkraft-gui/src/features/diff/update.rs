@@ -104,6 +104,7 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
 
         Message::StagingFileDiffLoaded(result) => {
             let tab = state.active_tab_mut();
+            let failed = result.is_err();
             match result {
                 Ok(diff) => {
                     tab.selected_diff = Some(diff);
@@ -115,6 +116,12 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             }
             // Close any open file preview.
             clear_preview!(state);
+            if failed {
+                // The lists can be out of date (a file deleted outside the
+                // app just before the watcher's refresh): reload so a row
+                // for a file that is gone drops out. The error stays.
+                return state.refresh_active_tab_quietly();
+            }
             Task::none()
         }
 

@@ -785,9 +785,9 @@ impl App {
     }
 
     /// Background refresh triggered by the git watcher — no status message so
-    /// user-set messages (selection counts, etc.) are not overwritten.
+    /// user-set messages (selection counts, etc.) are not overwritten, and the
+    /// error stays (a failed pull's own writes to `.git` trigger this).
     pub fn refresh_silent(&mut self) {
-        self.tab_mut().error_message = None;
         self.tab_mut().is_loading = true;
         self.refresh_internal();
     }
@@ -1091,6 +1091,13 @@ impl App {
                     Err(e) => {
                         self.tab_mut().error_message =
                             Some(format!("Failed to load staging diff: {e}"));
+                        // The lists can be out of date (a file deleted outside
+                        // the app just before the watcher's refresh): reload so
+                        // a row for a file that is gone drops out. The error
+                        // stays.
+                        if !self.tab().is_loading {
+                            self.refresh_silent();
+                        }
                     }
                 },
             }
@@ -3681,6 +3688,7 @@ mod tests {
         app.tab_mut().repo_path = Some(std::path::PathBuf::from("/tmp/fake-repo"));
         // Set a user message that should survive the silent refresh.
         app.tab_mut().status_message = Some("3 files selected".into());
+        app.tab_mut().error_message = Some("Automatic merge failed".into());
 
         app.refresh_silent();
 
@@ -3689,6 +3697,11 @@ mod tests {
             app.tab().status_message.as_deref(),
             Some("3 files selected"),
             "refresh_silent must NOT overwrite user status messages"
+        );
+        assert_eq!(
+            app.tab().error_message.as_deref(),
+            Some("Automatic merge failed"),
+            "refresh_silent must NOT clear the error"
         );
     }
 

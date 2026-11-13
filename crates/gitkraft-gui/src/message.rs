@@ -57,6 +57,10 @@ pub enum Message {
     RefreshRepo,
     /// Async refresh of the repository at the path completed.
     RepoRefreshed(PathBuf, Result<RepoPayload, String>),
+    /// A refresh nobody asked for (the git watcher saw a change, or a failed
+    /// pull left conflicts) completed: like `RepoRefreshed`, but what the tab
+    /// shows (an operation's status, an error) stays.
+    RepoQuietlyRefreshed(PathBuf, Result<RepoPayload, String>),
 
     // ── Branches ──────────────────────────────────────────────────────────
     /// User clicked a branch name → checkout that branch.

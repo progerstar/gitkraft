@@ -77,9 +77,23 @@ pub(crate) fn init_repo(path: PathBuf) -> Task<Message> {
 
 /// Refresh all data for an already-open repository, preserving scroll depth.
 pub(crate) fn refresh_repo(path: PathBuf, current_commit_count: usize) -> Task<Message> {
+    reload_with_depth(path, current_commit_count, Message::RepoRefreshed)
+}
+
+/// [`refresh_repo`] that leaves the tab's status and error as they are; see
+/// [`Message::RepoQuietlyRefreshed`].
+pub(crate) fn refresh_repo_quietly(path: PathBuf, current_commit_count: usize) -> Task<Message> {
+    reload_with_depth(path, current_commit_count, Message::RepoQuietlyRefreshed)
+}
+
+fn reload_with_depth(
+    path: PathBuf,
+    current_commit_count: usize,
+    done: fn(PathBuf, Result<RepoPayload, String>) -> Message,
+) -> Task<Message> {
     let target = path.clone();
     git_task!(
-        move |result| Message::RepoRefreshed(target, result),
+        move |result| done(target, result),
         gitkraft_core::load_repo_snapshot_with_depth(&path, current_commit_count).str_err()
     )
 }

@@ -67,6 +67,7 @@ impl GitKraft {
             | Message::RepoOpened(_)
             | Message::RefreshRepo
             | Message::RepoRefreshed(..)
+            | Message::RepoQuietlyRefreshed(..)
             | Message::OpenRecentRepo(_)
             | Message::CloseRepo
             | Message::RepoRecorded(_)
@@ -1282,7 +1283,7 @@ impl GitKraft {
                 // block refreshes if the flag got stuck (e.g. user switched
                 // tabs while pagination was in flight).
                 if self.has_repo() && !self.active_tab().is_loading {
-                    return self.refresh_active_tab();
+                    return self.refresh_active_tab_quietly();
                 }
                 Task::none()
             }

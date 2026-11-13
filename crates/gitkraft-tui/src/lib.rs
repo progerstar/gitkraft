@@ -140,7 +140,8 @@ where
         app.refresh_system_theme();
 
         // ── Reactive git watcher ──────────────────────────────────────────
-        // Spawn a background thread to watch the .git directory whenever:
+        // Spawn a background thread to watch the repository (.git and the
+        // working tree) whenever:
         //   • no watcher is running yet, or
         //   • the previous watcher thread exited (e.g., repo was closed).
         // The thread sends GitStateChanged via bg_tx on every file-system

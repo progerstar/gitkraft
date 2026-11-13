@@ -159,8 +159,9 @@ fn boot() -> (GitKraft, iced::Task<gitkraft_gui::Message>) {
 /// Reactive git-state watcher subscription.
 ///
 /// Spawns a background OS thread that uses `notify` to watch the repo's `.git`
-/// directory for any file change.  Changes are debounced (300 ms) so that a
-/// single git operation (which writes several files) triggers only one refresh.
+/// directory and its working tree (what git does not ignore) for any file
+/// change.  Changes are debounced (300 ms of quiet) so that a single git
+/// operation (which writes several files) triggers only one refresh.
 /// A 60-second fallback poll is included so the UI stays current on network
 /// file systems or environments where inotify/FSEvents are not delivered.
 ///
@@ -188,7 +189,7 @@ fn git_watch_builder(
     git_watch_stream(path.clone())
 }
 
-/// Stream that emits `FileSystemChanged` whenever the `.git` directory changes.
+/// Stream that emits `FileSystemChanged` whenever the repository changes.
 ///
 /// Uses `spawn_git_watcher` from core (debounced, fallback poll); its thread
 /// hands each change over through an async channel.

@@ -1126,6 +1126,20 @@ impl GitKraft {
     ///
     /// Returns [`Task::none()`] if no repository is open in the active tab.
     pub fn refresh_active_tab(&mut self) -> Task<Message> {
+        self.refresh_active_tab_with(crate::features::repo::commands::refresh_repo)
+    }
+
+    /// [`Self::refresh_active_tab`] for a refresh the user did not ask for
+    /// (the git watcher saw a change): the tab's status and error stay, so a
+    /// failed pull's error is not wiped by git's own writes to `.git`.
+    pub fn refresh_active_tab_quietly(&mut self) -> Task<Message> {
+        self.refresh_active_tab_with(crate::features::repo::commands::refresh_repo_quietly)
+    }
+
+    fn refresh_active_tab_with(
+        &mut self,
+        refresh: fn(PathBuf, usize) -> Task<Message>,
+    ) -> Task<Message> {
         let tab = self.active_tab();
         // Don't spawn a duplicate refresh when one is already in flight
         // (is_loading is also set by the manual RefreshRepo handler).
@@ -1140,7 +1154,7 @@ impl GitKraft {
                 // this guard, multiple refreshes could overlap — each opening a full
                 // git2::Repository with mmapped packfiles, causing GB-scale memory use.
                 self.active_tab_mut().is_loading = true;
-                crate::features::repo::commands::refresh_repo(path, depth)
+                refresh(path, depth)
             }
             None => Task::none(),
         }
@@ -2298,6 +2312,26 @@ mod tests {
     }
 
     #[test]
+    fn a_staging_diff_that_fails_to_load_reloads_the_lists() {
+        // Regression: a file deleted outside the app stayed listed, and
+        // clicking it only showed the error; the reload drops its row.
+        use crate::message::Message;
+        let mut state = GitKraft::new();
+        state.active_tab_mut().repo_path =
+            Some(std::path::PathBuf::from("/tmp/fake-repo-for-test"));
+        let error = "file 'Lua-RTOS-ESP32/partitions.csv_' not found in working-dir diff";
+
+        let _task = state.update(Message::StagingFileDiffLoaded(Err(error.into())));
+
+        let tab = state.active_tab();
+        assert!(tab.is_loading, "the lists are reloaded");
+        assert_eq!(
+            tab.error_message.as_deref(),
+            Some(format!("Failed to load staging diff: {error}").as_str())
+        );
+    }
+
+    #[test]
     fn refresh_active_tab_skips_when_already_loading() {
         // When is_loading is true (e.g. a manual Ctrl+R refresh is in flight),
         // refresh_active_tab must return Task::none() to avoid spawning a
@@ -2779,12 +2813,59 @@ mod tests {
         ));
 
         let a = &state.tabs[0];
-        assert!(!a.remote_busy && !a.is_loading);
+        assert!(!a.remote_busy);
+        assert!(a.is_loading, "the repo is reloaded after a failure too");
         assert_eq!(
             a.error_message.as_deref(),
             Some("ssh: connect to host example.com port 22: No route to host")
         );
         assert!(state.tabs[1].error_message.is_none());
+
+        let _ = state.update(Message::RepoQuietlyRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(fake_payload("/home/user/repo-a")),
+        ));
+        let a = &state.tabs[0];
+        assert!(!a.is_loading);
+        assert!(a.error_message.is_some(), "the reload keeps the error");
+    }
+
+    #[test]
+    fn failed_pull_error_survives_the_watcher_refresh() {
+        // Regression: git writes MERGE_HEAD, the index… while a pull fails
+        // with conflicts; the watcher's refresh then wiped the error banner a
+        // moment after it appeared.
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.active_tab = 0;
+        let conflict = "CONFLICT (content): Merge conflict in a.txt\n\
+                        Automatic merge failed; fix conflicts and then commit the result.";
+
+        let _ = state.update(Message::PullMerge);
+        let _ = state.update(Message::RemoteOpDone(
+            PathBuf::from("/home/user/repo-a"),
+            "Pulled from origin.".into(),
+            Err(conflict.into()),
+        ));
+        let _ = state.update(Message::RepoQuietlyRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(fake_payload("/home/user/repo-a")),
+        ));
+
+        let _ = state.update(Message::FileSystemChanged);
+        assert!(state.tabs[0].is_loading, "the watcher refreshes");
+        let _ = state.update(Message::RepoQuietlyRefreshed(
+            PathBuf::from("/home/user/repo-a"),
+            Ok(fake_payload("/home/user/repo-a")),
+        ));
+
+        let a = &state.tabs[0];
+        assert!(!a.is_loading);
+        assert_eq!(a.error_message.as_deref(), Some(conflict));
+
+        // Dismissing it still works.
+        let _ = state.update(Message::DismissError);
+        assert!(state.tabs[0].error_message.is_none());
     }
 
     #[test]

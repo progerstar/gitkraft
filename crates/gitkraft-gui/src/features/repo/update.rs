@@ -164,17 +164,41 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
 
         Message::GitOperationResult(path, result) => handle_tab_reloaded(state, &path, result),
 
+        Message::RepoQuietlyRefreshed(path, result) => {
+            let Some(idx) = state.tab_index_of(&path) else {
+                return Task::none();
+            };
+            state.tabs[idx].is_loading = false;
+            match result {
+                Ok(payload) => apply_loaded_quietly(state, idx, payload, path),
+                Err(e) => {
+                    state.tabs[idx].error_message = Some(e);
+                    Task::none()
+                }
+            }
+        }
+
         Message::RemoteOpDone(path, done, result) => {
             let Some(idx) = state.tab_index_of(&path) else {
                 return Task::none();
             };
-            state.tabs[idx].remote_busy = false;
-            let ok = result.is_ok();
-            let task = handle_tab_reloaded(state, &path, result);
-            if ok {
-                state.tabs[idx].status_message = Some(done);
+            let tab = &mut state.tabs[idx];
+            tab.remote_busy = false;
+            match result {
+                Ok(payload) => {
+                    let task = handle_tab_reloaded(state, &path, Ok(payload));
+                    state.tabs[idx].status_message = Some(done);
+                    task
+                }
+                // A failed pull can leave conflicts (or a half-done rebase):
+                // reload to show them, keeping git's error on screen.
+                // `is_loading` stays set until the reload is in.
+                Err(e) => {
+                    tab.error_message = Some(e);
+                    tab.status_message = None;
+                    commands::refresh_repo_quietly(path, tab.commits.len())
+                }
             }
-            task
         }
 
         Message::AutoFetchDone(path, result) => {
@@ -183,16 +207,8 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             };
             state.tabs[idx].auto_fetching = false;
             match result {
-                Ok(payload) => {
-                    // Silent: what the tab shows (an operation's status, an
-                    // error) stays, and so does a running operation's spinner.
-                    let tab = &mut state.tabs[idx];
-                    let shown = (tab.status_message.take(), tab.error_message.take());
-                    let task = apply_loaded(state, idx, payload, path);
-                    let tab = &mut state.tabs[idx];
-                    (tab.status_message, tab.error_message) = shown;
-                    task
-                }
+                // A running operation's spinner stays too.
+                Ok(payload) => apply_loaded_quietly(state, idx, payload, path),
                 // Offline or credentials needed: try again next time.
                 Err(_) => Task::none(),
             }
@@ -296,6 +312,22 @@ fn apply_loaded(
         ));
     }
     Task::batch(tasks)
+}
+
+/// [`apply_loaded`] for a reload the user did not ask for: what the tab
+/// shows (an operation's status, an error) stays.
+fn apply_loaded_quietly(
+    state: &mut GitKraft,
+    idx: usize,
+    payload: RepoPayload,
+    path: std::path::PathBuf,
+) -> Task<Message> {
+    let tab = &mut state.tabs[idx];
+    let shown = (tab.status_message.take(), tab.error_message.take());
+    let task = apply_loaded(state, idx, payload, path);
+    let tab = &mut state.tabs[idx];
+    (tab.status_message, tab.error_message) = shown;
+    task
 }
 
 /// Like `handle_repo_loaded` but writes into a specific tab index.

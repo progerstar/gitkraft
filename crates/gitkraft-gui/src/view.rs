@@ -1013,6 +1013,16 @@ fn file_context_menu_items<'a>(
         }
     }
 
+    // Add to .gitignore, as in GitHub Desktop.
+    let ignore_paths = gitignore_menu_paths(state, path, staged);
+    let ignore_entries = gitignore_menu_entries(&ignore_paths);
+    if !ignore_entries.is_empty() {
+        col = col.push(view_utils::context_menu_separator::<Message>());
+        for (label, msg) in ignore_entries {
+            col = col.push(menu_item(&label, msg));
+        }
+    }
+
     // Footer: copy info & show in folder
     col = col.push(view_utils::context_menu_separator::<Message>());
     col = col.push(menu_item(
@@ -1038,6 +1048,83 @@ fn file_context_menu_items<'a>(
     }
 
     col
+}
+
+/// Files the "add to .gitignore" items act on: every selected row when the
+/// right-clicked file is one of several selected, otherwise just that file.
+fn gitignore_menu_paths(state: &GitKraft, path: &str, staged: bool) -> Vec<String> {
+    let tab = state.active_tab();
+    if state.layout_style == LayoutStyle::GitHubDesktop {
+        let selection = &tab.changes_selection;
+        if selection.paths.len() > 1 && selection.contains(path) {
+            return features::github_layout::changes::changed_paths(tab)
+                .into_iter()
+                .filter(|p| selection.contains(p))
+                .collect();
+        }
+    } else {
+        let (changes, selected) = if staged {
+            (&tab.staged_changes, &tab.selected_staged)
+        } else {
+            (&tab.unstaged_changes, &tab.selected_unstaged)
+        };
+        if selected.len() > 1 {
+            return changes
+                .iter()
+                .map(|d| d.display_path())
+                .filter(|p| selected.contains(*p))
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    vec![path.to_string()]
+}
+
+/// Most "Add all *.ext files" items a menu shows (as GitHub Desktop).
+const MAX_IGNORE_EXTENSIONS: usize = 5;
+
+/// "Add to .gitignore" items, as (label, message), for the files `paths`: the
+/// file itself (or all of them), one of its folders, and every file with the
+/// same extension. `.gitignore` files are never offered.
+fn gitignore_menu_entries(paths: &[String]) -> Vec<(String, Message)> {
+    use gitkraft_core::IgnoreTarget;
+    use gitkraft_core::features::ignore::{file_extension, is_gitignore, parent_folders};
+
+    let files: Vec<String> = paths.iter().filter(|p| !is_gitignore(p)).cloned().collect();
+    let mut entries = Vec::new();
+    match files.as_slice() {
+        [] => return entries,
+        [file] => {
+            entries.push((
+                "Add file to .gitignore".to_string(),
+                Message::AddToGitignore(IgnoreTarget::Files(vec![file.clone()])),
+            ));
+            if !parent_folders(file).is_empty() {
+                entries.push((
+                    "Add folder to .gitignore\u{2026}".to_string(),
+                    Message::OpenIgnoreFolderMenu(file.clone()),
+                ));
+            }
+        }
+        _ => entries.push((
+            format!("Add {} selected files to .gitignore", files.len()),
+            Message::AddToGitignore(IgnoreTarget::Files(files.clone())),
+        )),
+    }
+
+    let mut extensions: Vec<&str> = Vec::new();
+    for ext in files.iter().filter_map(|f| file_extension(f)) {
+        if !extensions.contains(&ext) && extensions.len() < MAX_IGNORE_EXTENSIONS {
+            extensions.push(ext);
+        }
+    }
+    entries.extend(extensions.into_iter().map(|ext| {
+        (
+            format!("Add all *.{ext} files to .gitignore"),
+            Message::AddToGitignore(IgnoreTarget::Extension(ext.to_string())),
+        )
+    }));
+    entries
 }
 
 /// Build the context menu panel widget for the currently active menu.
@@ -1338,6 +1425,21 @@ fn context_menu_panel<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, M
             file_context_menu_items(state, c, path, true, menu_item).into()
         }
 
+        Some(crate::state::ContextMenu::IgnoreFolder { path }) => {
+            let header = view_utils::context_menu_header::<Message>(
+                "Add folder to .gitignore".to_string(),
+                c.muted,
+            );
+            let mut col = column![header];
+            for dir in gitkraft_core::features::ignore::parent_folders(path) {
+                col = col.push(menu_item(
+                    &format!("/{dir}/"),
+                    Message::AddToGitignore(gitkraft_core::IgnoreTarget::Folder(dir.to_string())),
+                ));
+            }
+            col.into()
+        }
+
         Some(crate::state::ContextMenu::CommitFile { oid, file_path }) => {
             let tab = state.active_tab();
             let multi_count = tab.selected_commit_file_indices.len();
@@ -1449,5 +1551,138 @@ fn context_menu_panel<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, M
         }
 
         None => Space::new().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitkraft_core::{DiffFileEntry, FileStatus, IgnoreTarget};
+
+    fn entry(path: &str) -> DiffFileEntry {
+        DiffFileEntry {
+            old_file: path.into(),
+            new_file: path.into(),
+            status: FileStatus::Modified,
+        }
+    }
+
+    fn paths(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn labels(names: &[&str]) -> Vec<String> {
+        gitignore_menu_entries(&paths(names))
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    fn targets(names: &[&str]) -> Vec<IgnoreTarget> {
+        gitignore_menu_entries(&paths(names))
+            .into_iter()
+            .filter_map(|(_, msg)| match msg {
+                Message::AddToGitignore(target) => Some(target),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_file_offers_itself_its_folders_and_its_extension() {
+        assert_eq!(
+            labels(&["src/ui/a.rs"]),
+            [
+                "Add file to .gitignore",
+                "Add folder to .gitignore\u{2026}",
+                "Add all *.rs files to .gitignore",
+            ]
+        );
+        assert!(matches!(
+            &gitignore_menu_entries(&paths(&["src/ui/a.rs"]))[1].1,
+            Message::OpenIgnoreFolderMenu(p) if p == "src/ui/a.rs"
+        ));
+        assert_eq!(
+            targets(&["src/ui/a.rs"]),
+            [
+                IgnoreTarget::Files(paths(&["src/ui/a.rs"])),
+                IgnoreTarget::Extension("rs".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_root_dotfile_offers_only_itself() {
+        assert_eq!(labels(&[".env"]), ["Add file to .gitignore"]);
+    }
+
+    #[test]
+    fn gitignore_files_are_never_offered() {
+        assert!(labels(&[".gitignore"]).is_empty());
+        assert!(labels(&["sub/.gitignore"]).is_empty());
+        // Left out of a selection, leaving one file.
+        assert_eq!(
+            targets(&["a.txt", ".gitignore"]),
+            [
+                IgnoreTarget::Files(paths(&["a.txt"])),
+                IgnoreTarget::Extension("txt".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_files_go_in_one_item_with_at_most_five_extensions() {
+        let names = [
+            "a.rs", "b.rs", "c.md", "d.toml", "e.json", "f.lock", "g.txt", "h",
+        ];
+        let got = labels(&names);
+        assert_eq!(got[0], "Add 8 selected files to .gitignore");
+        assert_eq!(
+            got[1..],
+            [
+                "Add all *.rs files to .gitignore",
+                "Add all *.md files to .gitignore",
+                "Add all *.toml files to .gitignore",
+                "Add all *.json files to .gitignore",
+                "Add all *.lock files to .gitignore",
+            ]
+        );
+        assert_eq!(targets(&names)[0], IgnoreTarget::Files(paths(&names)));
+    }
+
+    #[test]
+    fn two_pane_menu_covers_the_selection_only_when_the_clicked_row_is_in_it() {
+        let mut state = GitKraft::new();
+        state.layout_style = LayoutStyle::GitHubDesktop;
+        let tab = state.active_tab_mut();
+        tab.unstaged_changes = vec![entry("c.rs"), entry("b.rs"), entry("a.rs")];
+        tab.changes_selection.paths = ["c.rs", "a.rs"].map(String::from).into();
+
+        // Rows are listed in Changes-list order.
+        assert_eq!(
+            gitignore_menu_paths(&state, "c.rs", false),
+            ["a.rs", "c.rs"]
+        );
+        assert_eq!(gitignore_menu_paths(&state, "b.rs", false), ["b.rs"]);
+
+        state.active_tab_mut().changes_selection.paths = ["a.rs"].map(String::from).into();
+        assert_eq!(gitignore_menu_paths(&state, "a.rs", false), ["a.rs"]);
+    }
+
+    #[test]
+    fn classic_menu_covers_the_selected_files_of_its_list() {
+        let mut state = GitKraft::new();
+        state.layout_style = LayoutStyle::Classic;
+        let tab = state.active_tab_mut();
+        tab.unstaged_changes = vec![entry("a.rs"), entry("b.rs")];
+        tab.staged_changes = vec![entry("s.rs")];
+        assert_eq!(gitignore_menu_paths(&state, "a.rs", false), ["a.rs"]);
+
+        state.active_tab_mut().selected_unstaged = ["a.rs", "b.rs"].map(String::from).into();
+        assert_eq!(
+            gitignore_menu_paths(&state, "a.rs", false),
+            ["a.rs", "b.rs"]
+        );
+        assert_eq!(gitignore_menu_paths(&state, "s.rs", true), ["s.rs"]);
     }
 }

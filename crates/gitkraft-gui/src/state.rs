@@ -61,6 +61,8 @@ pub enum ContextMenu {
     UnstagedFile { path: String },
     /// A staged file in the staging area.
     StagedFile { path: String },
+    /// The folders of a changed file, to add one to `.gitignore`.
+    IgnoreFolder { path: String },
     /// A file in a commit diff.
     CommitFile { oid: String, file_path: String },
 }

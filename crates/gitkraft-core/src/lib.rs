@@ -27,6 +27,7 @@ pub use features::diff::{
 };
 pub use features::editor::{EDITOR_NAMES, Editor, open_file_default, show_in_folder};
 pub use features::graph::{GraphEdge, GraphRow};
+pub use features::ignore::{IgnoreTarget, add_to_gitignore};
 pub use features::log::file_history;
 pub use features::persistence::{AppSettings, LayoutSettings, RepoHistoryEntry};
 pub use features::remotes::RemoteInfo;

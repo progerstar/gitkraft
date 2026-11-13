@@ -111,6 +111,23 @@ pub(crate) fn discard_staged_file(path: PathBuf, file_path: String) -> Task<Mess
     )
 }
 
+/// Add `target` to the root `.gitignore`, then return how many patterns were
+/// added and the refreshed staging state.
+pub(crate) fn add_to_gitignore(
+    path: PathBuf,
+    target: gitkraft_core::IgnoreTarget,
+) -> Task<Message> {
+    let done = target.clone();
+    git_task!(
+        move |result| Message::GitignoreUpdated(done, result),
+        (|| {
+            let wd = crate::features::repo::commands::workdir(&path)?;
+            let added = gitkraft_core::add_to_gitignore(&wd, &target).str_err()?;
+            Ok((added, refresh_staging_state(&path)?))
+        })()
+    )
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 /// Re-read both the working-directory diff and the staged diff so the caller

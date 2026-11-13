@@ -161,7 +161,9 @@ impl GitKraft {
             | Message::StageSelected
             | Message::UnstageSelected
             | Message::DiscardSelected
-            | Message::DiscardStagedFile(_) => {
+            | Message::DiscardStagedFile(_)
+            | Message::AddToGitignore(_)
+            | Message::GitignoreUpdated(..) => {
                 crate::features::staging::update::update(self, message)
             }
 
@@ -652,6 +654,13 @@ impl GitKraft {
 
             Message::OpenStagedFileContextMenu(path) => {
                 self.open_context_menu(crate::state::ContextMenu::StagedFile {
+                    path: path.clone(),
+                });
+                Task::none()
+            }
+
+            Message::OpenIgnoreFolderMenu(path) => {
+                self.open_context_menu(crate::state::ContextMenu::IgnoreFolder {
                     path: path.clone(),
                 });
                 Task::none()

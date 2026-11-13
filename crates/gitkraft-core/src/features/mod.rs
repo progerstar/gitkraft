@@ -8,6 +8,7 @@ pub mod commits;
 pub mod diff;
 pub mod editor;
 pub mod graph;
+pub mod ignore;
 pub mod log;
 pub mod persistence;
 pub mod remotes;

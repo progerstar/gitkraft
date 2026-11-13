@@ -135,6 +135,14 @@ pub enum Message {
     DiscardStagedFile(String),
     /// Async staging operation completed.
     StagingUpdated(Result<StagingPayload, String>),
+    /// Add files, a folder or an extension to the root `.gitignore`.
+    AddToGitignore(gitkraft_core::IgnoreTarget),
+    /// `.gitignore` was updated: how many patterns were added, and the
+    /// refreshed staging state.
+    GitignoreUpdated(
+        gitkraft_core::IgnoreTarget,
+        Result<(usize, StagingPayload), String>,
+    ),
 
     // ── Commit creation ───────────────────────────────────────────────────
     /// User is typing in the commit-message input.
@@ -200,6 +208,8 @@ pub enum Message {
     OpenUnstagedFileContextMenu(String),
     /// User right-clicked a staged file.
     OpenStagedFileContextMenu(String),
+    /// "Ignore folder" in a file's menu: list the file's folders to pick from.
+    OpenIgnoreFolderMenu(String),
     /// User wants to view the diff of a stash entry.
     ViewStashDiff(usize),
     /// Stash diff loaded.

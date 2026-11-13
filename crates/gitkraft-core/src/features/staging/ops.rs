@@ -8,13 +8,21 @@ use tracing::debug;
 
 /// Stage a single file (add it to the index).
 ///
-/// Works for both tracked-modified and untracked files.
+/// Works for tracked-modified, untracked and deleted files: a file missing
+/// from the working directory is removed from the index (`git add` of a
+/// deletion), since `add_path` needs the file on disk to stat it.
 pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
     debug!("staging file: {}", path);
+    let workdir = repo
+        .workdir()
+        .context("repository has no working directory")?;
     let mut index = repo.index().context("failed to read index")?;
-    index
-        .add_path(Path::new(path))
-        .with_context(|| format!("failed to stage '{path}'"))?;
+    if workdir.join(path).symlink_metadata().is_ok() {
+        index.add_path(Path::new(path))
+    } else {
+        index.remove_path(Path::new(path))
+    }
+    .with_context(|| format!("failed to stage '{path}'"))?;
     index.write().context("failed to write index")?;
     Ok(())
 }
@@ -113,6 +121,21 @@ pub fn discard_file_changes(repo: &Repository, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stop tracking files (`git rm --cached`): remove them from the index and
+/// leave them on disk. A file in HEAD then shows as a staged deletion until
+/// the next commit. Paths not in the index are skipped.
+pub fn untrack_files(repo: &Repository, paths: &[String]) -> Result<()> {
+    debug!("untracking: {:?}", paths);
+    let mut index = repo.index().context("failed to read index")?;
+    for path in paths {
+        index
+            .remove_path(Path::new(path))
+            .with_context(|| format!("failed to untrack '{path}'"))?;
+    }
+    index.write().context("failed to write index")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +211,18 @@ mod tests {
     }
 
     #[test]
+    fn staging_a_deleted_file_stages_its_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        fs::remove_file(tmp.path().join("hello.txt")).unwrap();
+
+        stage_file(&repo, "hello.txt").unwrap();
+
+        let status = repo.status_file(Path::new("hello.txt")).unwrap();
+        assert_eq!(status, git2::Status::INDEX_DELETED);
+    }
+
+    #[test]
     fn discard_restores_file() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_repo_with_commit(tmp.path());
@@ -199,6 +234,23 @@ mod tests {
 
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content.replace("\r\n", "\n"), "hello world\n");
+    }
+
+    #[test]
+    fn untracking_keeps_the_file_and_stages_its_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        fs::write(tmp.path().join("hello.txt"), "changed\n").unwrap();
+        fs::write(tmp.path().join(".gitignore"), "/hello.txt\n").unwrap();
+
+        // Not in the index: skipped.
+        untrack_files(&repo, &["hello.txt".into(), "missing.txt".into()]).unwrap();
+
+        assert!(tmp.path().join("hello.txt").exists());
+        let status = repo.status_file(Path::new("hello.txt")).unwrap();
+        assert_eq!(status, git2::Status::INDEX_DELETED | git2::Status::IGNORED);
+        let unstaged = crate::features::diff::get_working_dir_file_list(&repo).unwrap();
+        assert!(unstaged.iter().all(|e| e.display_path() != "hello.txt"));
     }
 
     #[test]

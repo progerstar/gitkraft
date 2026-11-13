@@ -54,28 +54,29 @@ fn apply_staging(tab: &mut RepoTab, payload: StagingPayload) {
     tab.prune_changes_selection();
 }
 
-/// Status line after adding `target` to `.gitignore`. Ignoring does not
-/// untrack a file git already tracks, so say so when such files are still
-/// listed as changed.
-fn gitignore_status(tab: &RepoTab, target: &IgnoreTarget, added: usize) -> String {
+/// Status line after adding `target` to `.gitignore`.
+fn gitignore_status(target: &IgnoreTarget, added: usize) -> String {
     let what = target.label();
-    let mut status = if added == 0 {
+    if added == 0 {
         format!("{what} is already in .gitignore.")
     } else {
         format!("Added {what} to .gitignore.")
-    };
-    if let IgnoreTarget::Files(paths) = target {
-        let still_listed = tab
-            .unstaged_changes
-            .iter()
-            .chain(&tab.staged_changes)
-            .any(|f| paths.iter().any(|p| p == f.display_path()));
-        if still_listed {
-            status
-                .push_str(" Files git already tracks stay tracked (untrack with git rm --cached).");
-        }
     }
-    status
+}
+
+/// Changed files `target` covers that are still listed: git keeps tracking
+/// files it already tracks whatever `.gitignore` says (untracked ones have
+/// dropped out of the refreshed lists). Sorted, without duplicates.
+fn tracked_matches(tab: &RepoTab, target: &IgnoreTarget) -> Vec<String> {
+    let paths: std::collections::BTreeSet<&str> = tab
+        .unstaged_changes
+        .iter()
+        .chain(&tab.staged_changes)
+        .filter(|f| f.status != gitkraft_core::FileStatus::Untracked)
+        .map(|f| f.display_path())
+        .filter(|p| target.matches(p))
+        .collect();
+    paths.into_iter().map(str::to_string).collect()
 }
 
 /// Handle all staging-related messages, returning a [`Task`] for any follow-up
@@ -270,10 +271,46 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             match result {
                 Ok((added, payload)) => {
                     apply_staging(tab, payload);
-                    tab.status_message = Some(gitignore_status(tab, &target, added));
+                    tab.status_message = Some(gitignore_status(&target, added));
+                    tab.pending_untrack = tracked_matches(tab, &target);
                 }
                 Err(e) => {
                     tab.error_message = Some(format!("Could not update .gitignore: {e}"));
+                    tab.status_message = None;
+                }
+            }
+            Task::none()
+        }
+
+        Message::ConfirmUntrack => {
+            let paths = std::mem::take(&mut state.active_tab_mut().pending_untrack);
+            if paths.is_empty() {
+                return Task::none();
+            }
+            with_repo!(
+                state,
+                format!("Untracking {} file(s)…", paths.len()),
+                |repo_path| commands::untrack_files(repo_path, paths)
+            )
+        }
+
+        Message::CancelUntrack => {
+            state.active_tab_mut().pending_untrack.clear();
+            Task::none()
+        }
+
+        Message::FilesUntracked(count, result) => {
+            let tab = state.active_tab_mut();
+            match result {
+                Ok(payload) => {
+                    apply_staging(tab, payload);
+                    tab.status_message = Some(format!(
+                        "Stopped tracking {count} file(s): they stay on disk; \
+                         commit to remove them from the repository."
+                    ));
+                }
+                Err(e) => {
+                    tab.error_message = Some(format!("Could not stop tracking: {e}"));
                     tab.status_message = None;
                 }
             }
@@ -358,16 +395,77 @@ mod tests {
     }
 
     #[test]
-    fn status_says_tracked_files_stay_tracked() {
+    fn tracked_files_left_in_the_list_are_offered_for_untracking() {
         let mut state = GitKraft::new();
         let still_listed = vec![entry("a.rs", FileStatus::Modified)];
         updated(&mut state, files(&["a.rs", "new.txt"]), 2, still_listed);
-        let status = state.active_tab().status_message.clone().unwrap();
-        assert!(
-            status.starts_with("Added 2 files to .gitignore."),
-            "{status}"
+        let tab = state.active_tab();
+        assert_eq!(
+            tab.status_message.as_deref(),
+            Some("Added 2 files to .gitignore.")
         );
-        assert!(status.contains("git rm --cached"), "{status}");
+        assert_eq!(tab.pending_untrack, ["a.rs"]);
+    }
+
+    #[test]
+    fn untracking_offer_covers_what_the_folder_rule_matches() {
+        let mut state = GitKraft::new();
+        let payload = StagingPayload {
+            unstaged: vec![
+                entry("src/ui/a.rs", FileStatus::Modified),
+                entry("src/b.rs", FileStatus::Modified),
+                entry("src/ui/new.rs", FileStatus::Untracked),
+            ],
+            staged: vec![
+                entry("src/ui/c.rs", FileStatus::New),
+                entry("src/ui/a.rs", FileStatus::Modified),
+            ],
+        };
+        let target = IgnoreTarget::Folder("src/ui".into());
+        let _ = state.update(Message::GitignoreUpdated(target, Ok((1, payload))));
+        assert_eq!(
+            state.active_tab().pending_untrack,
+            ["src/ui/a.rs", "src/ui/c.rs"]
+        );
+    }
+
+    #[test]
+    fn no_untracking_offer_when_nothing_tracked_matches() {
+        let mut state = GitKraft::new();
+        let unrelated = vec![entry("b.rs", FileStatus::Modified)];
+        updated(&mut state, files(&["a.rs"]), 1, unrelated);
+        assert!(state.active_tab().pending_untrack.is_empty());
+    }
+
+    #[test]
+    fn keeping_files_tracked_closes_the_offer() {
+        let mut state = GitKraft::new();
+        state.active_tab_mut().pending_untrack = vec!["a.rs".into()];
+        let _ = state.update(Message::CancelUntrack);
+        assert!(state.active_tab().pending_untrack.is_empty());
+
+        state.active_tab_mut().pending_untrack = vec!["a.rs".into()];
+        let _ = state.update(Message::CloseFileBlame); // Escape
+        assert!(state.active_tab().pending_untrack.is_empty());
+    }
+
+    #[test]
+    fn untracked_files_refresh_the_lists() {
+        let mut state = GitKraft::new();
+        state.active_tab_mut().unstaged_changes = vec![entry("a.csv", FileStatus::Modified)];
+        let payload = StagingPayload {
+            unstaged: Vec::new(),
+            staged: vec![entry("a.csv", FileStatus::Deleted)],
+        };
+        let _ = state.update(Message::FilesUntracked(1, Ok(payload)));
+        let tab = state.active_tab();
+        assert!(tab.unstaged_changes.is_empty());
+        assert_eq!(tab.staged_changes.len(), 1);
+        assert!(
+            tab.status_message
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Stopped tracking 1 file(s)"))
+        );
     }
 
     #[test]

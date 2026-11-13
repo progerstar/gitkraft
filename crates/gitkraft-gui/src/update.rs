@@ -163,7 +163,10 @@ impl GitKraft {
             | Message::DiscardSelected
             | Message::DiscardStagedFile(_)
             | Message::AddToGitignore(_)
-            | Message::GitignoreUpdated(..) => {
+            | Message::GitignoreUpdated(..)
+            | Message::ConfirmUntrack
+            | Message::CancelUntrack
+            | Message::FilesUntracked(..) => {
                 crate::features::staging::update::update(self, message)
             }
 
@@ -1529,6 +1532,7 @@ impl GitKraft {
                 let tab = self.active_tab_mut();
                 tab.pending_discard = None;
                 tab.pending_delete_file = None;
+                tab.pending_untrack.clear();
                 tab.blame_path = None;
                 tab.blame_lines = Vec::new();
                 tab.blame_scroll = 0.0;

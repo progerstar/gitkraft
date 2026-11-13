@@ -128,6 +128,20 @@ pub(crate) fn add_to_gitignore(
     )
 }
 
+/// Stop tracking `file_paths` (`git rm --cached`), then return how many and
+/// the refreshed staging state.
+pub(crate) fn untrack_files(path: PathBuf, file_paths: Vec<String>) -> Task<Message> {
+    let count = file_paths.len();
+    git_task!(
+        move |result| Message::FilesUntracked(count, result),
+        (|| {
+            let repo = open_repo!(&path);
+            gitkraft_core::features::staging::untrack_files(&repo, &file_paths).str_err()?;
+            refresh_staging_state(&path)
+        })()
+    )
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 /// Re-read both the working-directory diff and the staged diff so the caller

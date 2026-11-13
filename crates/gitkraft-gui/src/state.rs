@@ -202,6 +202,9 @@ pub struct RepoTab {
 
     /// File path pending discard confirmation (None = no pending discard).
     pub pending_discard: Option<String>,
+    /// Tracked files a new `.gitignore` rule covers: git keeps tracking them,
+    /// so a banner offers `git rm --cached` (empty = no banner).
+    pub pending_untrack: Vec<String>,
 
     // ── Feedback ──────────────────────────────────────────────────────────
     /// Transient status-bar message (e.g. "Branch created").
@@ -336,6 +339,7 @@ impl RepoTab {
             changes_selection: Default::default(),
             changes_list_viewport: None,
             pending_discard: None,
+            pending_untrack: Vec::new(),
             status_message: None,
             error_message: None,
             is_loading: false,

@@ -42,6 +42,17 @@ impl IgnoreTarget {
             Self::Extension(ext) => format!("'*.{ext}'"),
         }
     }
+
+    /// Whether the file at `path` (repo-relative) falls under this target.
+    pub fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Files(paths) => paths.iter().any(|p| p == path),
+            Self::Folder(dir) => path
+                .strip_prefix(dir.trim_end_matches('/'))
+                .is_some_and(|rest| rest.starts_with('/')),
+            Self::Extension(ext) => file_extension(path) == Some(ext.as_str()),
+        }
+    }
 }
 
 /// Escape the characters git's ignore patterns treat specially, so `path`
@@ -172,6 +183,20 @@ mod tests {
         assert_eq!(files(&["a", "b", "c"]).label(), "3 files");
         assert_eq!(IgnoreTarget::Folder("a/b".into()).label(), "'a/b/'");
         assert_eq!(IgnoreTarget::Extension("log".into()).label(), "'*.log'");
+    }
+
+    #[test]
+    fn matching_paths() {
+        assert!(files(&["a/b.txt"]).matches("a/b.txt"));
+        assert!(!files(&["a/b.txt"]).matches("a/b.txt.bak"));
+        let folder = IgnoreTarget::Folder("src/ui".into());
+        assert!(folder.matches("src/ui/a.rs"));
+        assert!(folder.matches("src/ui/deep/b.rs"));
+        assert!(!folder.matches("src/uix/a.rs"));
+        assert!(!folder.matches("src/ui"));
+        let ext = IgnoreTarget::Extension("csv".into());
+        assert!(ext.matches("x/serial.csv"));
+        assert!(!ext.matches("x/serial.csv.gz"));
     }
 
     #[test]

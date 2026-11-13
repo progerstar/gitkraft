@@ -112,6 +112,7 @@ fn changes_keys_active(state: &GitKraft) -> bool {
         && tab.repo_path.is_some()
         && tab.context_menu.is_none()
         && tab.pending_discard.is_none()
+        && tab.pending_untrack.is_empty()
         && !state.branch_popup_open
 }
 

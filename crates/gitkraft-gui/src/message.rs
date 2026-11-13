@@ -143,6 +143,12 @@ pub enum Message {
         gitkraft_core::IgnoreTarget,
         Result<(usize, StagingPayload), String>,
     ),
+    /// Stop tracking the files of the "Stop tracking?" banner (`git rm --cached`).
+    ConfirmUntrack,
+    /// Close the "Stop tracking?" banner and keep the files tracked.
+    CancelUntrack,
+    /// Files were untracked (how many), with the refreshed staging state.
+    FilesUntracked(usize, Result<StagingPayload, String>),
 
     // ── Commit creation ───────────────────────────────────────────────────
     /// User is typing in the commit-message input.

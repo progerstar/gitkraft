@@ -216,6 +216,10 @@ impl GitKraft {
             main_col = main_col.push(discard_confirmation_banner(path, &c));
         }
 
+        if !tab.pending_untrack.is_empty() {
+            main_col = main_col.push(untrack_banner(&tab.pending_untrack, &c));
+        }
+
         main_col = main_col.push(header).push(middle);
         if !ghd {
             // The GitHub Desktop layout keeps changes and the commit box in its left column.
@@ -420,6 +424,55 @@ fn discard_confirmation_banner<'a>(path: &str, c: &ThemeColors) -> Element<'a, M
         ..Default::default()
     })
     .into()
+}
+
+/// "Stop tracking?" offer after adding tracked files to `.gitignore`: git
+/// keeps tracking them until they leave the index.
+fn untrack_banner<'a>(paths: &[String], c: &ThemeColors) -> Element<'a, Message> {
+    use iced::widget::{Space, button, row, text};
+
+    let label = text(untrack_question(paths)).size(13).color(c.text_primary);
+
+    let confirm_btn = button(text("Stop tracking").size(12).color(c.accent))
+        .padding([3, 12])
+        .style(theme::toolbar_button)
+        .on_press(Message::ConfirmUntrack);
+
+    let cancel_btn = button(text("Keep tracking").size(12).color(c.text_secondary))
+        .padding([3, 12])
+        .style(theme::toolbar_button)
+        .on_press(Message::CancelUntrack);
+
+    container(
+        row![
+            container(label).width(Length::Fill),
+            Space::new().width(12),
+            confirm_btn,
+            Space::new().width(6),
+            cancel_btn
+        ]
+        .align_y(iced::Alignment::Center)
+        .padding([6, 12]),
+    )
+    .width(Length::Fill)
+    .style(theme::header_style)
+    .into()
+}
+
+/// Text of the "Stop tracking?" banner.
+fn untrack_question(paths: &[String]) -> String {
+    match paths {
+        [one] => format!(
+            "'{}' is tracked by git, so .gitignore does not hide it. Stop tracking it \
+             (git rm --cached)? It stays on disk; the next commit removes it from the repository.",
+            gitkraft_core::path_basename(one)
+        ),
+        _ => format!(
+            "{} files are tracked by git, so .gitignore does not hide them. Stop tracking them \
+             (git rm --cached)? They stay on disk; the next commit removes them from the repository.",
+            paths.len()
+        ),
+    }
 }
 
 fn delete_confirmation_banner<'a>(file_name: &str, c: &ThemeColors) -> Element<'a, Message> {
@@ -1667,6 +1720,14 @@ mod tests {
 
         state.active_tab_mut().changes_selection.paths = ["a.rs"].map(String::from).into();
         assert_eq!(gitignore_menu_paths(&state, "a.rs", false), ["a.rs"]);
+    }
+
+    #[test]
+    fn untrack_question_names_one_file_or_counts_several() {
+        let one = untrack_question(&paths(&["odrfid/serial.csv"]));
+        assert!(one.starts_with("'serial.csv' is tracked by git, so .gitignore does not hide it."));
+        let two = untrack_question(&paths(&["a.csv", "b.csv"]));
+        assert!(two.starts_with("2 files are tracked by git, so .gitignore does not hide them."));
     }
 
     #[test]

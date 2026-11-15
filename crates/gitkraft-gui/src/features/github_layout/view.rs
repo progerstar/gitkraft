@@ -289,12 +289,10 @@ fn small_text_button<'a>(label: &'a str, msg: Option<Message>) -> Element<'a, Me
     .into()
 }
 
-/// The "Current branch" dropdown: branches, stashes and remotes, under the
-/// point where it was opened, with a click-outside-to-close backdrop.
-pub(crate) fn branch_popup<'a>(
-    state: &'a GitKraft,
-    base: Element<'a, Message>,
-) -> Element<'a, Message> {
+/// The "Current branch" dropdown overlay: branches, stashes and remotes,
+/// under the point where it was opened, with a click-outside-to-close
+/// backdrop.
+pub(crate) fn branch_popup(state: &GitKraft) -> Element<'_, Message> {
     let c = state.colors();
     let (x, y) = state.branch_popup_pos;
     let (win_w, win_h) = (state.window_width, state.window_height);
@@ -336,7 +334,7 @@ pub(crate) fn branch_popup<'a>(
     )
     .on_press(Message::CloseBranchPopup);
 
-    iced::widget::stack![base, backdrop, positioned].into()
+    iced::widget::stack![backdrop, positioned].into()
 }
 
 fn divider_line<'a>(c: &ThemeColors) -> Element<'a, Message> {

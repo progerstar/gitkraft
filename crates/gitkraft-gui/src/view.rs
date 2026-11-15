@@ -51,13 +51,16 @@ impl GitKraft {
             // switch between tabs even when the active one has no repo.
             let welcome = features::repo::view::welcome_view(self);
             let tab = self.active_tab();
-            let mut outer = column![tab_bar];
             // Error banner and status bar are shown even without a repo so
-            // messages like "Settings opened in …" are always visible.
+            // messages like "Settings opened in …" are always visible. The
+            // banner gets a slot that is always present, so it coming or
+            // going does not reset the welcome screen's widget state, such
+            // as the recent repositories' scroll offset.
+            let mut banner = column![].width(Length::Fill);
             if let Some(ref err) = tab.error_message {
-                outer = outer.push(error_banner(err, &c));
+                banner = banner.push(error_banner(err, &c));
             }
-            outer = outer.push(welcome);
+            let mut outer = column![tab_bar, banner, welcome];
             if tab.status_message.is_some() {
                 outer = outer.push(status_bar_view(self));
             }
@@ -66,7 +69,8 @@ impl GitKraft {
                 .height(Length::Fill)
                 .style(theme::bg_style)
                 .into();
-            return self.with_about_overlay(welcome_screen);
+            let about = self.show_about.then(|| widgets::about::view(self));
+            return with_overlays(welcome_screen, [about]);
         }
 
         let tab = self.active_tab();
@@ -198,29 +202,32 @@ impl GitKraft {
         // ── Status bar ────────────────────────────────────────────────────
         let status_bar = status_bar_view(self);
 
-        // ── Error banner (if any) ─────────────────────────────────────────
-        let mut main_col = column![].width(Length::Fill).height(Length::Fill);
-
-        main_col = main_col.push(tab_bar);
+        // ── Banners (error, confirmations) ────────────────────────────────
+        // They share one column that is always present, so a banner coming
+        // or going does not shift the panes below it in the widget tree,
+        // which would reset their state (scroll offsets included).
+        let mut banners = column![].width(Length::Fill);
 
         if let Some(ref err) = tab.error_message {
-            main_col = main_col.push(error_banner(err, &c));
+            banners = banners.push(error_banner(err, &c));
         }
 
         if let Some(ref path) = tab.pending_delete_file {
             let file_name = gitkraft_core::path_basename(path);
-            main_col = main_col.push(delete_confirmation_banner(file_name, &c));
+            banners = banners.push(delete_confirmation_banner(file_name, &c));
         }
 
         if let Some(ref path) = tab.pending_discard {
-            main_col = main_col.push(discard_confirmation_banner(path, &c));
+            banners = banners.push(discard_confirmation_banner(path, &c));
         }
 
         if !tab.pending_untrack.is_empty() {
-            main_col = main_col.push(untrack_banner(&tab.pending_untrack, &c));
+            banners = banners.push(untrack_banner(&tab.pending_untrack, &c));
         }
 
-        main_col = main_col.push(header).push(middle);
+        let mut main_col = column![tab_bar, banners, header, middle]
+            .width(Length::Fill)
+            .height(Length::Fill);
         if !ghd {
             // The GitHub Desktop layout keeps changes and the commit box in its left column.
             main_col = main_col.push(h_divider).push(staging);
@@ -241,22 +248,14 @@ impl GitKraft {
             .into();
 
         // ── Search overlay ────────────────────────────────────────────────
-        let ma: Element<'_, Message> = if self.search_visible {
-            let search_panel = search_overlay(self, &c);
-            iced::widget::stack![ma, search_panel].into()
-        } else {
-            ma
-        };
+        let search = self.search_visible.then(|| search_overlay(self, &c));
 
         // ── Branch dropdown (GitHub Desktop layout) ─────────────────────
-        let ma: Element<'_, Message> = if ghd && self.branch_popup_open {
-            features::github_layout::view::branch_popup(self, ma)
-        } else {
-            ma
-        };
+        let branch_popup = (ghd && self.branch_popup_open)
+            .then(|| features::github_layout::view::branch_popup(self));
 
         // ── Context menu overlay ──────────────────────────────────
-        let with_menu: Element<'_, Message> = if self.active_tab().context_menu.is_some() {
+        let menu = self.active_tab().context_menu.is_some().then(|| {
             // Transparent full-screen backdrop — clicking it dismisses the menu.
             let backdrop = mouse_area(
                 container(Space::new().width(Length::Fill).height(Length::Fill))
@@ -280,22 +279,38 @@ impl GitKraft {
             .style(theme::context_menu_style)
             .build();
 
-            iced::widget::stack![ma, backdrop, positioned].into()
-        } else {
-            ma
-        };
+            iced::widget::stack![backdrop, positioned].into()
+        });
 
-        self.with_about_overlay(with_menu)
+        let about = self.show_about.then(|| widgets::about::view(self));
+        with_overlays(ma, [search, branch_popup, menu, about])
     }
+}
 
-    /// Stack the About dialog on top of `base` when it is open.
-    fn with_about_overlay<'a>(&'a self, base: Element<'a, Message>) -> Element<'a, Message> {
-        if self.show_about {
-            iced::widget::stack![base, widgets::about::view(self)].into()
-        } else {
-            base
-        }
-    }
+/// Layer the open `overlays` over `base`.
+///
+/// The result is always a stack holding `base` and then one layer per
+/// overlay slot, with empty space standing in for a closed overlay. iced keeps
+/// widget state such as scroll offsets by position in the widget tree, so
+/// wrapping `base` in a stack only while an overlay is open would rebuild all
+/// state under it: opening a context menu would scroll every list to the top.
+/// Fixed slots also keep one overlay's state when another opens or closes.
+fn with_overlays<'a, const N: usize>(
+    base: Element<'a, Message>,
+    overlays: [Option<Element<'a, Message>>; N],
+) -> Element<'a, Message> {
+    let layers = std::iter::once(base)
+        .chain(
+            overlays
+                .into_iter()
+                .map(|overlay| overlay.unwrap_or_else(|| Space::new().into())),
+        )
+        .collect();
+    // `from_vec` keeps every layer; `push` would drop zero-sized ones.
+    iced::widget::Stack::from_vec(layers)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// Render the status bar at the very bottom of the window.
@@ -1745,5 +1760,80 @@ mod tests {
             ["a.rs", "b.rs"]
         );
         assert_eq!(gitignore_menu_paths(&state, "s.rs", true), ["s.rs"]);
+    }
+
+    /// Addresses of the widget states held in `tree`, to tell whether a
+    /// diff kept them or rebuilt them.
+    fn state_addrs(tree: &iced::advanced::widget::Tree) -> Vec<*const ()> {
+        use iced::advanced::widget::tree;
+        let mut addrs = Vec::new();
+        if let tree::State::Some(state) = &tree.state {
+            addrs.push(std::ptr::from_ref::<dyn std::any::Any>(&**state).cast::<()>());
+        }
+        for child in &tree.children {
+            addrs.extend(state_addrs(child));
+        }
+        addrs
+    }
+
+    /// A tab with a repository and one changed file, shown in `layout`.
+    fn repo_state(layout: LayoutStyle) -> GitKraft {
+        let mut state = GitKraft::new();
+        state.layout_style = layout;
+        let tab = state.active_tab_mut();
+        tab.repo_path = Some("/tmp/fake-repo-for-test".into());
+        tab.unstaged_changes = vec![entry("a.rs")];
+        state
+    }
+
+    /// Whether `change` leaves every widget state of `state`'s window in
+    /// place, as with the Changes list's scroll offset when a context menu
+    /// opens.
+    fn keeps_widget_state(mut state: GitKraft, change: impl FnOnce(&mut GitKraft)) -> bool {
+        use iced::advanced::widget::Tree;
+        let mut tree = Tree::new(state.view());
+        let before = state_addrs(&tree);
+        assert!(!before.is_empty());
+        change(&mut state);
+        tree.diff(state.view());
+        let after = state_addrs(&tree);
+        before.iter().all(|addr| after.contains(addr))
+    }
+
+    #[test]
+    fn overlays_and_banners_keep_the_widget_state_under_them() {
+        for layout in [LayoutStyle::Classic, LayoutStyle::GitHubDesktop] {
+            let keeps = |change: fn(&mut GitKraft)| keeps_widget_state(repo_state(layout), change);
+            assert!(keeps(|s| {
+                s.open_context_menu(crate::state::ContextMenu::UnstagedFile {
+                    path: "a.rs".into(),
+                });
+            }));
+            assert!(keeps(|s| s.search_visible = true));
+            assert!(keeps(|s| s.show_about = true));
+            assert!(keeps(|s| {
+                s.active_tab_mut().error_message = Some("boom".into());
+            }));
+            assert!(keeps(|s| {
+                s.active_tab_mut().pending_delete_file = Some("a.rs".into());
+            }));
+            assert!(keeps(|s| {
+                s.active_tab_mut().pending_discard = Some("a.rs".into());
+            }));
+            assert!(keeps(|s| {
+                s.active_tab_mut().pending_untrack = vec!["a.rs".into()];
+            }));
+        }
+        assert!(keeps_widget_state(
+            repo_state(LayoutStyle::GitHubDesktop),
+            |s| s.branch_popup_open = true,
+        ));
+    }
+
+    #[test]
+    fn the_error_banner_keeps_the_welcome_screen_state() {
+        assert!(keeps_widget_state(GitKraft::new(), |s| {
+            s.active_tab_mut().error_message = Some("boom".into());
+        }));
     }
 }

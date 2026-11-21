@@ -157,6 +157,7 @@ impl GitKraft {
             | Message::ConfirmDiscard(_)
             | Message::CancelDiscard
             | Message::StagingUpdated(_)
+            | Message::StagedAll(_)
             | Message::ToggleSelectUnstaged(_)
             | Message::ToggleSelectStaged(_)
             | Message::StageSelected

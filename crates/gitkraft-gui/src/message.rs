@@ -139,6 +139,9 @@ pub enum Message {
     DiscardStagedFile(String),
     /// Async staging operation completed.
     StagingUpdated(Result<StagingPayload, String>),
+    /// "Stage all" completed: the nested repositories it skipped, and the
+    /// refreshed staging state.
+    StagedAll(Result<(Vec<String>, StagingPayload), String>),
     /// Add files, a folder or an extension to the root `.gitignore`.
     AddToGitignore(gitkraft_core::IgnoreTarget),
     /// `.gitignore` was updated: how many patterns were added, and the

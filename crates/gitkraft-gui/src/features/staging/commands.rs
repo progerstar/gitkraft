@@ -25,11 +25,17 @@ pub(crate) fn unstage_file(path: PathBuf, file_path: String) -> Task<Message> {
     ))
 }
 
-/// Stage all unstaged files, then return the refreshed staging state.
+/// Stage all unstaged files, then return the nested repositories that were
+/// skipped and the refreshed staging state.
 pub(crate) fn stage_all(path: PathBuf) -> Task<Message> {
-    staging_op!(path, |repo| gitkraft_core::features::staging::stage_all(
-        &repo
-    ))
+    git_task!(
+        Message::StagedAll,
+        (|| {
+            let repo = open_repo!(&path);
+            let skipped = gitkraft_core::features::staging::stage_all(&repo).str_err()?;
+            Ok((skipped, refresh_staging_state(&path)?))
+        })()
+    )
 }
 
 /// Unstage all staged files, then return the refreshed staging state.

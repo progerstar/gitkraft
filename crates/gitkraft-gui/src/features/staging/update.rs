@@ -64,6 +64,19 @@ fn gitignore_status(target: &IgnoreTarget, added: usize) -> String {
     }
 }
 
+/// Status line after "Stage all", naming the nested repositories it skipped.
+fn stage_all_status(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        "Staging area updated.".into()
+    } else {
+        format!(
+            "Staged all files except nested git repositories: {}. \
+             Add them to .gitignore or as submodules.",
+            skipped.join(", ")
+        )
+    }
+}
+
 /// Changed files `target` covers that are still listed: git keeps tracking
 /// files it already tracks whatever `.gitignore` says (untracked ones have
 /// dropped out of the refreshed lists). Sorted, without duplicates.
@@ -160,6 +173,16 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+
+        Message::StagedAll(result) => match result {
+            Ok((skipped, payload)) => {
+                let tab = state.active_tab_mut();
+                apply_staging(tab, payload);
+                tab.status_message = Some(stage_all_status(&skipped));
+                Task::none()
+            }
+            Err(e) => update(state, Message::StagingUpdated(Err(e))),
+        },
 
         Message::ToggleSelectUnstaged(path) => {
             let shift_held = state.keyboard_modifiers.shift();
@@ -465,6 +488,24 @@ mod tests {
             tab.status_message
                 .as_deref()
                 .is_some_and(|s| s.starts_with("Stopped tracking 1 file(s)"))
+        );
+    }
+
+    #[test]
+    fn stage_all_names_the_skipped_nested_repos() {
+        let mut state = GitKraft::new();
+        let payload = StagingPayload {
+            unstaged: vec![entry("vendor/", FileStatus::Untracked)],
+            staged: vec![entry("a.rs", FileStatus::Modified)],
+        };
+        let _ = state.update(Message::StagedAll(Ok((vec!["vendor/".into()], payload))));
+        let tab = state.active_tab();
+        assert_eq!(tab.staged_changes.len(), 1);
+        assert!(tab.error_message.is_none());
+        assert!(
+            tab.status_message
+                .as_deref()
+                .is_some_and(|s| s.contains("nested git repositories: vendor/."))
         );
     }
 

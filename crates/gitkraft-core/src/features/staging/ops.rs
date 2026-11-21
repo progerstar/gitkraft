@@ -56,14 +56,34 @@ pub fn unstage_file(repo: &Repository, path: &str) -> Result<()> {
 }
 
 /// Stage all changes in the working directory (tracked and untracked).
-pub fn stage_all(repo: &Repository) -> Result<()> {
+///
+/// Untracked nested git repositories are skipped: libgit2 fails the whole
+/// operation on them ("invalid path"), and recording them as gitlinks the way
+/// `git add` does is rarely what's wanted. Returns their paths (with a
+/// trailing `/`) so the caller can point the user at them.
+pub fn stage_all(repo: &Repository) -> Result<Vec<String>> {
     debug!("staging all files");
+    let workdir = repo
+        .workdir()
+        .context("repository has no working directory")?;
     let mut index = repo.index().context("failed to read index")?;
+    let mut skipped = Vec::new();
+    // libgit2 recurses into plain untracked directories, so the only
+    // directory entries it hands over are nested repositories.
+    let mut skip_nested_repos = |path: &Path, _: &[u8]| -> i32 {
+        let is_dir = path.as_os_str().as_encoded_bytes().ends_with(b"/");
+        if is_dir && workdir.join(path).join(".git").exists() {
+            skipped.push(path.to_string_lossy().into_owned());
+            1
+        } else {
+            0
+        }
+    };
     index
-        .add_all(["*"], IndexAddOption::DEFAULT, None)
+        .add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_nested_repos))
         .context("failed to stage all files")?;
     index.write().context("failed to write index")?;
-    Ok(())
+    Ok(skipped)
 }
 
 /// Unstage all currently staged changes, resetting the index back to HEAD.
@@ -208,6 +228,22 @@ mod tests {
         let head2 = repo.head().unwrap().peel_to_tree().unwrap();
         let diff2 = repo.diff_tree_to_index(Some(&head2), None, None).unwrap();
         assert_eq!(diff2.deltas().len(), 0);
+    }
+
+    #[test]
+    fn stage_all_skips_untracked_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        Repository::init(tmp.path().join("vendor")).unwrap();
+        fs::write(tmp.path().join("vendor/lib.c"), "int x;\n").unwrap();
+        fs::write(tmp.path().join("new.txt"), "new file\n").unwrap();
+
+        let skipped = stage_all(&repo).unwrap();
+
+        assert_eq!(skipped, ["vendor/"]);
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("new.txt"), 0).is_some());
+        assert!(index.iter().all(|e| !e.path.starts_with(b"vendor")));
     }
 
     #[test]

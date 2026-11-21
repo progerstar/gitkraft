@@ -6,8 +6,11 @@ pub(crate) trait StringErr<T> {
 }
 
 impl<T, E: std::fmt::Display> StringErr<T> for Result<T, E> {
+    /// Uses the alternate form so an `anyhow` error keeps its whole cause
+    /// chain ("failed to stage all files: invalid path: …"), not just the
+    /// outermost context.
     fn str_err(self) -> Result<T, String> {
-        self.map_err(|e| e.to_string())
+        self.map_err(|e| format!("{e:#}"))
     }
 }
 

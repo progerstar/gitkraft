@@ -1168,7 +1168,7 @@ impl App {
         bg_op!(self, "Staging…", staging, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::staging::stage_file(&repo, &file_path)
-                .map_err(|e| format!("stage: {e}"))?;
+                .map_err(|e| format!("stage: {e:#}"))?;
             Ok(format!("Staged: {file_path}"))
         });
     }
@@ -1179,7 +1179,7 @@ impl App {
         bg_op!(self, "Unstaging…", staging, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::staging::unstage_file(&repo, &file_path)
-                .map_err(|e| format!("unstage: {e}"))?;
+                .map_err(|e| format!("unstage: {e:#}"))?;
             Ok(format!("Unstaged: {file_path}"))
         });
     }
@@ -1187,9 +1187,16 @@ impl App {
     pub fn stage_all(&mut self) {
         bg_op!(self, "Staging all…", staging, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
-            gitkraft_core::features::staging::stage_all(&repo)
-                .map_err(|e| format!("stage all: {e}"))?;
-            Ok("Staged all files".into())
+            let skipped = gitkraft_core::features::staging::stage_all(&repo)
+                .map_err(|e| format!("stage all: {e:#}"))?;
+            Ok(if skipped.is_empty() {
+                "Staged all files".into()
+            } else {
+                format!(
+                    "Staged all except nested repos (add to .gitignore or as submodules): {}",
+                    skipped.join(", ")
+                )
+            })
         });
     }
 
@@ -1197,7 +1204,7 @@ impl App {
         bg_op!(self, "Unstaging all…", staging, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::staging::unstage_all(&repo)
-                .map_err(|e| format!("unstage all: {e}"))?;
+                .map_err(|e| format!("unstage all: {e:#}"))?;
             Ok("Unstaged all files".into())
         });
     }
@@ -1209,7 +1216,7 @@ impl App {
         bg_op!(self, "Discarding…", staging, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::staging::discard_file_changes(&repo, &file_path)
-                .map_err(|e| format!("discard: {e}"))?;
+                .map_err(|e| format!("discard: {e:#}"))?;
             Ok(format!("Discarded changes: {file_path}"))
         });
     }
@@ -1280,7 +1287,7 @@ impl App {
         bg_op!(self, "Committing…", refresh, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             let info = gitkraft_core::features::commits::create_commit(&repo, &msg)
-                .map_err(|e| format!("commit: {e}"))?;
+                .map_err(|e| format!("commit: {e:#}"))?;
             Ok(format!("Committed: {} {}", info.short_oid(), info.summary))
         });
     }
@@ -1305,7 +1312,7 @@ impl App {
                 |repo_path| {
                     let path = std::path::Path::new(&repo_path);
                     gitkraft_core::features::branches::checkout_remote_branch(path, &name)
-                        .map_err(|e| format!("checkout remote: {e}"))?;
+                        .map_err(|e| format!("checkout remote: {e:#}"))?;
                     Ok(format!("Checked out: {name}"))
                 }
             );
@@ -1317,7 +1324,7 @@ impl App {
                 |repo_path| {
                     let repo = open_repo_str(&repo_path)?;
                     gitkraft_core::features::branches::checkout_branch(&repo, &name)
-                        .map_err(|e| format!("checkout: {e}"))?;
+                        .map_err(|e| format!("checkout: {e:#}"))?;
                     Ok(format!("Checked out: {name}"))
                 }
             );
@@ -1338,7 +1345,7 @@ impl App {
         bg_op!(self, "Creating branch…", refresh, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::branches::create_branch(&repo, &name)
-                .map_err(|e| format!("create branch: {e}"))?;
+                .map_err(|e| format!("create branch: {e:#}"))?;
             Ok(format!("Created branch: {name}"))
         });
     }
@@ -1353,7 +1360,7 @@ impl App {
         bg_op!(self, "Deleting branch\u{2026}", refresh, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::branches::delete_branch(&repo, &name)
-                .map_err(|e| format!("delete branch: {e}"))?;
+                .map_err(|e| format!("delete branch: {e:#}"))?;
             Ok(format!("Deleted branch: {name}"))
         });
     }
@@ -1375,7 +1382,7 @@ impl App {
         let name = branch.name.clone();
         self.remote_op(format!("Deleting remote {name}\u{2026}"), move |path| {
             gitkraft_core::features::branches::delete_remote_branch(path, &name)
-                .map_err(|e| format!("delete remote: {e}"))?;
+                .map_err(|e| format!("delete remote: {e:#}"))?;
             Ok(format!("Deleted remote branch: {name}"))
         });
     }
@@ -1421,7 +1428,7 @@ impl App {
         bg_op!(self, "Renaming branch\u{2026}", refresh, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::branches::rename_branch(&repo, &old_name, &new_name)
-                .map_err(|e| format!("rename: {e}"))?;
+                .map_err(|e| format!("rename: {e:#}"))?;
             Ok(format!("Renamed '{}' \u{2192} '{}'", old_name, new_name))
         });
     }
@@ -1443,7 +1450,7 @@ impl App {
         let name = branch.name.clone();
         self.remote_op(format!("Pushing {name}\u{2026}"), move |path| {
             gitkraft_core::features::branches::push_branch(path, &name, "origin")
-                .map_err(|e| format!("push: {e}"))?;
+                .map_err(|e| format!("push: {e:#}"))?;
             Ok(format!("Pushed '{name}'"))
         });
     }
@@ -1465,7 +1472,7 @@ impl App {
         let name = branch.name.clone();
         self.remote_op(format!("Pulling {name}\u{2026}"), move |path| {
             gitkraft_core::features::branches::pull_rebase(path, "origin")
-                .map_err(|e| format!("pull: {e}"))?;
+                .map_err(|e| format!("pull: {e:#}"))?;
             Ok(format!("Pulled '{name}'"))
         });
     }
@@ -1482,7 +1489,7 @@ impl App {
         bg_op!(self, "Stashing…", refresh, |repo_path| {
             let mut repo = open_repo_str(&repo_path)?;
             let entry = gitkraft_core::features::stash::stash_save(&mut repo, msg.as_deref())
-                .map_err(|e| format!("stash save: {e}"))?;
+                .map_err(|e| format!("stash save: {e:#}"))?;
             Ok(format!("Stashed: {}", entry.message))
         });
     }
@@ -1492,7 +1499,7 @@ impl App {
         bg_op!(self, "Popping stash…", refresh, |repo_path| {
             let mut repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::stash::stash_pop(&mut repo, idx)
-                .map_err(|e| format!("stash pop: {e}"))?;
+                .map_err(|e| format!("stash pop: {e:#}"))?;
             Ok(format!("Stash @{{{idx}}} popped"))
         });
     }
@@ -1502,7 +1509,7 @@ impl App {
         bg_op!(self, "Dropping stash…", refresh, |repo_path| {
             let mut repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::stash::stash_drop(&mut repo, idx)
-                .map_err(|e| format!("stash drop: {e}"))?;
+                .map_err(|e| format!("stash drop: {e:#}"))?;
             Ok(format!("Stash @{{{idx}}} dropped"))
         });
     }
@@ -1520,7 +1527,7 @@ impl App {
         bg_op!(self, "Applying stash\u{2026}", refresh, |repo_path| {
             let mut repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::stash::stash_apply(&mut repo, stash_index)
-                .map_err(|e| format!("stash apply: {e}"))?;
+                .map_err(|e| format!("stash apply: {e:#}"))?;
             Ok(format!("Applied stash@{{{stash_index}}}"))
         });
     }
@@ -2028,7 +2035,7 @@ impl App {
         self.remote_op("Fetching…".into(), |path| {
             // System git, not libgit2: credential helpers and the SSH agent work.
             gitkraft_core::features::branches::fetch_remote_cli(path, "origin")
-                .map_err(|e| format!("fetch: {e}"))?;
+                .map_err(|e| format!("fetch: {e:#}"))?;
             Ok("Fetched from origin".into())
         });
     }
@@ -2036,7 +2043,7 @@ impl App {
     pub fn pull_rebase(&mut self) {
         self.remote_op("Pulling (rebase)…".into(), |path| {
             gitkraft_core::features::branches::pull_rebase(path, "origin")
-                .map_err(|e| format!("pull: {e}"))?;
+                .map_err(|e| format!("pull: {e:#}"))?;
             Ok("Pulled (rebase) from origin".into())
         });
     }
@@ -2063,7 +2070,7 @@ impl App {
         };
         self.remote_op(format!("Pushing {branch}…"), move |path| {
             gitkraft_core::features::branches::push_branch(path, &branch, "origin")
-                .map_err(|e| format!("push: {e}"))?;
+                .map_err(|e| format!("push: {e:#}"))?;
             Ok(format!("Pushed {branch} to origin"))
         });
     }
@@ -2077,7 +2084,7 @@ impl App {
         };
         self.remote_op(format!("Force pushing {branch}…"), move |path| {
             gitkraft_core::features::branches::force_push_branch(path, &branch, "origin")
-                .map_err(|e| format!("force push: {e}"))?;
+                .map_err(|e| format!("force push: {e:#}"))?;
             Ok(format!("Force pushed {branch} to origin"))
         });
     }
@@ -2391,7 +2398,7 @@ impl App {
                 let workdir = std::path::Path::new(&repo_path);
                 for oid in &oids {
                     gitkraft_core::features::repo::revert_commit(workdir, oid)
-                        .map_err(|e| format!("revert {}: {e}", &oid[..oid.len().min(7)]))?;
+                        .map_err(|e| format!("revert {}: {e:#}", &oid[..oid.len().min(7)]))?;
                 }
                 Ok(format!("Reverted {count} commit(s)"))
             })();
@@ -2448,7 +2455,7 @@ impl App {
         bg_op!(self, "Restoring file\u{2026}", refresh, |repo_path| {
             let repo = open_repo_str(&repo_path)?;
             gitkraft_core::features::diff::checkout_file_at_commit(&repo, &commit_oid, &file_path)
-                .map_err(|e| format!("restore: {e}"))?;
+                .map_err(|e| format!("restore: {e:#}"))?;
             Ok(format!("Restored: {file_path}"))
         });
     }
@@ -2507,7 +2514,7 @@ impl App {
             let res: Result<String, String> = (|| {
                 for oid in &oids {
                     gitkraft_core::features::commits::cherry_pick_commit(&repo_path, oid)
-                        .map_err(|e| format!("cherry-pick {}: {e}", &oid[..oid.len().min(7)]))?;
+                        .map_err(|e| format!("cherry-pick {}: {e:#}", &oid[..oid.len().min(7)]))?;
                 }
                 Ok(format!("Cherry-picked {} commit(s)", oids.len()))
             })();
@@ -2571,7 +2578,7 @@ impl App {
 
 /// Open a repository, mapping the error to a `String` for background-task results.
 fn open_repo_str(path: &std::path::Path) -> Result<git2::Repository, String> {
-    gitkraft_core::features::repo::open_repo(path).map_err(|e| e.to_string())
+    gitkraft_core::features::repo::open_repo(path).map_err(|e| format!("{e:#}"))
 }
 
 /// Clamp a `ListState` selection to be within `[0, len)`, or `None` if empty.

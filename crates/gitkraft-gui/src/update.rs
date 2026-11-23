@@ -13,11 +13,11 @@ use crate::message::Message;
 use crate::state::GitKraft;
 
 /// Brings the window back and to the front.
-fn show_window() -> Task<Message> {
-    iced::window::oldest().and_then(|id| {
+fn show_window(token: Option<String>) -> Task<Message> {
+    iced::window::oldest().and_then(move |id| {
         iced::window::set_mode(id, iced::window::Mode::Windowed)
             .chain(iced::window::minimize(id, false))
-            .chain(iced::window::gain_focus(id))
+            .chain(crate::window::activate(id, token.clone()))
     })
 }
 
@@ -76,7 +76,7 @@ impl GitKraft {
         if !self.tray_on && self.background {
             // Hidden with no tray to bring it back would strand the user.
             self.background = false;
-            return show_window();
+            return show_window(None);
         }
         Task::none()
     }
@@ -84,8 +84,11 @@ impl GitKraft {
     fn tray_command(&mut self, command: crate::tray::TrayCommand) -> Task<Message> {
         use crate::tray::TrayCommand as C;
         match command {
-            C::Show => show_window(),
-            C::ShowHub => Task::batch([self.open_hub(false), show_window()]),
+            C::Show => show_window(crate::tray::take_activation_token()),
+            C::ShowHub => Task::batch([
+                self.open_hub(false),
+                show_window(crate::tray::take_activation_token()),
+            ]),
             C::RunAgents => {
                 let job = self
                     .hub

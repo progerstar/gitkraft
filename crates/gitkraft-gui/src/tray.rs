@@ -170,6 +170,25 @@ fn send(command: TrayCommand) {
     let _ = sender().unbounded_send(command);
 }
 
+/// The XDG activation token the tray host gave with the last click that shows the window.
+static ACTIVATION_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Keeps the token of a click that shows the window, for [`take_activation_token`].
+fn set_activation_token(token: Option<String>) {
+    if let Ok(mut slot) = ACTIVATION_TOKEN.lock() {
+        *slot = token;
+    }
+}
+
+/// The activation token of the last "show" click, once. On Wayland only a window raised with it
+/// comes to the front, and the busy cursor its launch started stops.
+pub fn take_activation_token() -> Option<String> {
+    ACTIVATION_TOKEN
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
 /// The clicks on the menu, as a stream for an iced subscription.
 pub fn commands() -> BoxStream<'static, TrayCommand> {
     let _ = sender();
@@ -250,7 +269,7 @@ mod imp {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-    use super::{Entry, TrayCommand, TrayInfo, entries, send};
+    use super::{Entry, TrayCommand, TrayInfo, entries, send, set_activation_token};
 
     thread_local! {
         static TRAY: RefCell<Option<(TrayIcon, TrayInfo)>> = const { RefCell::new(None) };
@@ -338,13 +357,23 @@ mod imp {
     use ksni::TrayMethods;
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-    use super::{Entry, TrayCommand, TrayInfo, entries, send};
+    use super::{Entry, TrayCommand, TrayInfo, entries, send, set_activation_token};
 
     static UPDATES: OnceLock<UnboundedSender<TrayInfo>> = OnceLock::new();
 
     #[derive(Debug)]
     struct Tray {
         info: TrayInfo,
+    }
+
+    /// A click on the icon or a menu entry. One that shows the window keeps the host's
+    /// activation token: GNOME hands it over just before the click and only answers for the
+    /// current event, so it is read here, inside the click.
+    fn clicked(cmd: TrayCommand) {
+        if matches!(cmd, TrayCommand::Show | TrayCommand::ShowHub) {
+            set_activation_token(ksni::current_xdg_activation_token());
+        }
+        send(cmd);
     }
 
     /// RGBA to the ARGB32 (network order) the protocol wants.
@@ -379,7 +408,7 @@ mod imp {
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
-            send(TrayCommand::Show);
+            clicked(TrayCommand::Show);
         }
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -395,14 +424,14 @@ mod imp {
                     .into(),
                     Entry::Item(cmd, label) => StandardItem {
                         label,
-                        activate: Box::new(move |_: &mut Self| send(cmd)),
+                        activate: Box::new(move |_: &mut Self| clicked(cmd)),
                         ..Default::default()
                     }
                     .into(),
                     Entry::Check(cmd, label, checked) => CheckmarkItem {
                         label,
                         checked,
-                        activate: Box::new(move |_: &mut Self| send(cmd)),
+                        activate: Box::new(move |_: &mut Self| clicked(cmd)),
                         ..Default::default()
                     }
                     .into(),
@@ -483,6 +512,13 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_activation_token_is_handed_out_once() {
+        set_activation_token(Some("tok".into()));
+        assert_eq!(take_activation_token().as_deref(), Some("tok"));
+        assert_eq!(take_activation_token(), None);
+    }
 
     #[test]
     fn every_command_has_its_own_id_and_the_menu_offers_each_once() {

@@ -2354,6 +2354,9 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "tui-spinner",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winresource",
 ]
 

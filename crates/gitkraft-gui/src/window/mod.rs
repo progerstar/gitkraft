@@ -19,6 +19,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "linux")]
+mod wayland;
 
 /// One-time window setup as an iced task (a no-op where the platform needs nothing).
 ///
@@ -38,6 +40,27 @@ pub fn setup<M: Send + 'static>() -> iced::Task<M> {
 #[cfg(not(target_os = "macos"))]
 pub fn setup<M: Send + 'static>() -> iced::Task<M> {
     iced::Task::none()
+}
+
+/// Brings window `id` to the front. On Wayland with an activation `token` (from the tray) it
+/// uses that, the only way the compositor lets a window raise itself, which also ends the busy
+/// cursor the token's launch started; otherwise it asks for focus.
+pub fn activate<M: Send + 'static>(id: iced::window::Id, token: Option<String>) -> iced::Task<M> {
+    #[cfg(target_os = "linux")]
+    if let Some(token) = token {
+        return iced::window::run(id, move |window| wayland::activate(window, &token)).then(
+            move |activated| {
+                if activated {
+                    iced::Task::none()
+                } else {
+                    iced::window::gain_focus(id)
+                }
+            },
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = token;
+    iced::window::gain_focus(id)
 }
 
 /// Wayland `app_id` and X11 `WM_CLASS` of the window. Desktops match it against the

@@ -56,6 +56,11 @@ tray-icon = { version = "0.21", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["tokio"] }
+# Raising the window on Wayland with the tray's activation token (`src/window/wayland.rs`).
+# The versions and features winit already builds, so nothing new is compiled.
+wayland-client    = "0.31"
+wayland-backend   = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 # Windows: `build.rs` embeds assets/gitkraft.ico into gitkraft.exe (Explorer, shortcuts).
 [target.'cfg(windows)'.build-dependencies]

@@ -367,4 +367,27 @@ mod tests {
         )));
         assert_eq!(selected(&state), ["c"]);
     }
+
+    #[test]
+    fn staging_refresh_closes_the_diff_of_a_row_that_is_gone() {
+        let mut state = state_with_changes();
+        click(&mut state, "a", Modifiers::default());
+        state.active_tab_mut().selected_diff = Some(gitkraft_core::DiffInfo {
+            old_file: "a".into(),
+            new_file: "a".into(),
+            status: FileStatus::Modified,
+            hunks: Vec::new(),
+            old_id: None,
+            new_id: None,
+        });
+        // `a` was discarded: the lists no longer have it.
+        let _ = state.update(Message::StagingUpdated(Ok(
+            crate::message::StagingPayload {
+                unstaged: vec![entry("c")],
+                staged: vec![],
+            },
+        )));
+        assert!(selected(&state).is_empty());
+        assert!(state.active_tab().selected_diff.is_none());
+    }
 }

@@ -51,7 +51,7 @@ fn toggle_staging_file(
 fn apply_staging(tab: &mut RepoTab, payload: StagingPayload) {
     tab.unstaged_changes = payload.unstaged;
     tab.staged_changes = payload.staged;
-    tab.prune_changes_selection();
+    tab.prune_gone_changes();
 }
 
 /// Status line after adding `target` to `.gitignore`.

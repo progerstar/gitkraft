@@ -283,6 +283,7 @@ fn apply_single_file_navigation(app: &mut App, new_idx: usize) {
     app.tab_mut().diff_scroll = 0;
     if let Some(cached) = app.tab().commit_diffs.get(&new_idx).cloned() {
         app.tab_mut().selected_diff = Some(cached);
+        app.tab_mut().diff_from_staging = false;
     } else {
         let file_path = app.tab().commit_files[new_idx].display_path().to_string();
         app.load_single_file_diff(new_idx, file_path);

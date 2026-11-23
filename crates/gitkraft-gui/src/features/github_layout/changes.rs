@@ -250,8 +250,11 @@ impl ListViewport {
 }
 
 impl RepoTab {
-    /// Drop Changes-list selection entries whose files have no changes left.
-    pub(crate) fn prune_changes_selection(&mut self) {
+    /// Drop Changes-list selection entries whose files have no changes left,
+    /// and close the working-tree diff of such a file (after a commit or a
+    /// discard, say), so the diff viewer does not keep showing a file the
+    /// lists no longer have.
+    pub(crate) fn prune_gone_changes(&mut self) {
         let rows: HashSet<&str> = self
             .unstaged_changes
             .iter()
@@ -259,6 +262,19 @@ impl RepoTab {
             .map(|f| f.display_path())
             .collect();
         self.changes_selection.retain(&rows);
+
+        // With no commit or stash open, the diff on show came from the
+        // staging lists.
+        let gone = self.selected_commit_oid.is_none()
+            && self.commit_files.is_empty()
+            && self
+                .selected_diff
+                .as_ref()
+                .is_some_and(|d| !rows.contains(d.display_path()));
+        if gone {
+            self.selected_diff = None;
+            self.diff_scroll_offset = 0.0;
+        }
     }
 }
 

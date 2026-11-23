@@ -247,6 +247,9 @@ pub struct RepoTab {
     pub staged_list_state: ListState,
     pub staging_focus: StagingFocus,
     pub selected_diff: Option<DiffInfo>,
+    /// `selected_diff` is a staged or working-tree diff from the staging
+    /// lists, not a commit's.
+    pub diff_from_staging: bool,
     pub diff_scroll: u16,
     /// Which half of the diff split pane has keyboard focus.
     pub diff_sub_pane: DiffSubPane,
@@ -341,6 +344,26 @@ pub struct RepoTab {
 }
 
 impl RepoTab {
+    /// Close the staging diff once its file has no changes left (after a
+    /// commit or a discard, say), so the diff pane does not keep showing a
+    /// file the staging lists no longer have.
+    fn close_gone_staging_diff(&mut self) {
+        let gone = self.diff_from_staging
+            && self.selected_diff.as_ref().is_some_and(|d| {
+                let path = d.display_path();
+                !self
+                    .unstaged_changes
+                    .iter()
+                    .chain(&self.staged_changes)
+                    .any(|f| f.display_path() == path)
+            });
+        if gone {
+            self.selected_diff = None;
+            self.diff_from_staging = false;
+            self.diff_scroll = 0;
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -360,6 +383,7 @@ impl RepoTab {
             staged_list_state: ListState::default(),
             staging_focus: StagingFocus::Unstaged,
             selected_diff: None,
+            diff_from_staging: false,
             diff_scroll: 0,
             diff_sub_pane: DiffSubPane::FileList,
             anchor_file_index: None,
@@ -862,6 +886,7 @@ impl App {
                             );
                             tab.staged_changes = payload.staged;
                             clamp_list_state(&mut tab.staged_list_state, tab.staged_changes.len());
+                            tab.close_gone_staging_diff();
                             tab.stashes = payload.stashes;
                             clamp_list_state(&mut tab.stash_list_state, tab.stashes.len());
                             tab.remotes = payload.remotes;
@@ -920,6 +945,7 @@ impl App {
                                     .collect();
                                 tab.commit_diff_file_index = 0;
                                 tab.selected_diff = Some(diffs[0].clone());
+                                tab.diff_from_staging = false;
                                 tab.diff_scroll = 0;
                                 if diffs.len() > 1 {
                                     tab.status_message = Some(format!(
@@ -975,6 +1001,7 @@ impl App {
                             let is_multi = tab.selected_file_indices.len() > 1;
                             if !is_multi && file_index == tab.commit_diff_file_index {
                                 tab.selected_diff = Some(diff);
+                                tab.diff_from_staging = false;
                                 tab.diff_scroll = 0;
                             }
                             if tab.commit_files.len() > 1 {
@@ -1086,6 +1113,7 @@ impl App {
                     Ok(diff) => {
                         let tab = self.tab_mut();
                         tab.selected_diff = Some(diff);
+                        tab.diff_from_staging = true;
                         tab.diff_scroll = 0;
                     }
                     Err(e) => {
@@ -1158,6 +1186,7 @@ impl App {
             tab.staged_list_state
                 .select(Some(tab.staged_changes.len() - 1));
         }
+        tab.close_gone_staging_diff();
     }
 
     // ── Staging operations ───────────────────────────────────────────────
@@ -1621,6 +1650,7 @@ impl App {
         ));
         if let Some(cached) = self.tab().commit_diffs.get(&new_index).cloned() {
             self.tab_mut().selected_diff = Some(cached);
+            self.tab_mut().diff_from_staging = false;
         } else {
             let file_path = self.tab().commit_files[new_index]
                 .display_path()
@@ -1650,6 +1680,7 @@ impl App {
         ));
         if let Some(cached) = self.tab().commit_diffs.get(&new_index).cloned() {
             self.tab_mut().selected_diff = Some(cached);
+            self.tab_mut().diff_from_staging = false;
         } else {
             let file_path = self.tab().commit_files[new_index]
                 .display_path()
@@ -4693,5 +4724,87 @@ mod tests {
         assert!(!tab.commit_diffs.is_empty());
         tab.commit_diffs.clear();
         assert!(tab.commit_diffs.is_empty());
+    }
+
+    fn changed(path: &str) -> DiffFileEntry {
+        DiffFileEntry {
+            old_file: path.into(),
+            new_file: path.into(),
+            status: gitkraft_core::FileStatus::Modified,
+        }
+    }
+
+    fn diff_of(path: &str) -> DiffInfo {
+        DiffInfo {
+            old_file: path.into(),
+            new_file: path.into(),
+            status: gitkraft_core::FileStatus::Modified,
+            hunks: Vec::new(),
+            old_id: None,
+            new_id: None,
+        }
+    }
+
+    fn staging_refreshed(app: &mut App, unstaged: &[&str], staged: &[&str]) {
+        app.bg_tx
+            .send(BackgroundResult::StagingRefreshed(Ok(StagingPayload {
+                unstaged: unstaged.iter().map(|p| changed(p)).collect(),
+                staged: staged.iter().map(|p| changed(p)).collect(),
+            })))
+            .unwrap();
+        app.poll_background();
+    }
+
+    #[test]
+    fn staging_refresh_closes_the_diff_of_a_file_that_is_gone() {
+        // Regression: after a commit the diff pane kept showing the
+        // committed file while the staging lists no longer had it.
+        let mut app = App::new();
+        app.tab_mut().staged_changes = vec![changed("a.rs")];
+        app.bg_tx
+            .send(BackgroundResult::StagingDiffLoaded(Ok(diff_of("a.rs"))))
+            .unwrap();
+        app.poll_background();
+        assert!(app.tab().selected_diff.is_some());
+
+        staging_refreshed(&mut app, &["b.rs"], &[]);
+
+        assert!(app.tab().selected_diff.is_none());
+    }
+
+    #[test]
+    fn staging_refresh_keeps_the_diff_of_a_file_still_changed() {
+        let mut app = App::new();
+        app.bg_tx
+            .send(BackgroundResult::StagingDiffLoaded(Ok(diff_of("a.rs"))))
+            .unwrap();
+        app.poll_background();
+
+        // Staged, so it moved to the other list.
+        staging_refreshed(&mut app, &[], &["a.rs"]);
+
+        assert!(app.tab().selected_diff.is_some());
+    }
+
+    #[test]
+    fn staging_refresh_keeps_a_commit_diff() {
+        // A commit's files are not in the staging lists; its diff stays.
+        let mut app = App::new();
+        app.bg_tx
+            .send(BackgroundResult::StagingDiffLoaded(Ok(diff_of("a.rs"))))
+            .unwrap();
+        app.bg_tx
+            .send(BackgroundResult::CommitDiffLoaded(Ok(vec![diff_of(
+                "c.rs",
+            )])))
+            .unwrap();
+        app.poll_background();
+
+        staging_refreshed(&mut app, &[], &[]);
+
+        assert_eq!(
+            app.tab().selected_diff.as_ref().map(|d| d.display_path()),
+            Some("c.rs")
+        );
     }
 }

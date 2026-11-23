@@ -20,7 +20,9 @@ impl GitKraft {
         let task = self.dispatch(message);
         // Whatever selected a diff, start loading its images if it is one.
         let preview = self.ensure_image_preview();
-        Task::batch([task, preview])
+        // Whatever finished the tab's load, catch up on changes made during it.
+        let pending = self.run_pending_refresh();
+        Task::batch([task, preview, pending])
     }
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
@@ -1275,18 +1277,24 @@ impl GitKraft {
             }
 
             Message::FileSystemChanged => {
-                // Don't refresh while the active tab is performing a full
-                // load (e.g. opening a new repo).  Background pagination
+                // Don't start a second load while the active tab is loading
+                // (e.g. opening a new repo); defer it instead.  Background pagination
                 // (is_loading_more_commits) is NOT checked here — the
                 // "don't shrink" guard in apply_payload already prevents
                 // a stale refresh from overwriting a larger paginated list.
                 // Checking is_loading_more_commits here would permanently
                 // block refreshes if the flag got stuck (e.g. user switched
                 // tabs while pagination was in flight).
-                if self.has_repo() && !self.active_tab().is_loading {
-                    return self.refresh_active_tab_quietly();
+                if !self.has_repo() {
+                    return Task::none();
                 }
-                Task::none()
+                if self.active_tab().is_loading {
+                    // Reload once the running load or operation is done:
+                    // it may have read the files before this change.
+                    self.active_tab_mut().refresh_pending = true;
+                    return Task::none();
+                }
+                self.refresh_active_tab_quietly()
             }
 
             Message::OpenInEditor(path) => {

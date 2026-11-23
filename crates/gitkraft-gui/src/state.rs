@@ -213,6 +213,10 @@ pub struct RepoTab {
     pub error_message: Option<String>,
     /// True while an async operation is in flight.
     pub is_loading: bool,
+    /// The git watcher saw a change while `is_loading` was set; the tab
+    /// reloads once it is idle, so the change is not lost until the
+    /// fallback poll.
+    pub refresh_pending: bool,
     /// A fetch, pull or push the user started is running; another one cannot
     /// start until it finishes.
     pub remote_busy: bool,
@@ -343,6 +347,7 @@ impl RepoTab {
             status_message: None,
             error_message: None,
             is_loading: false,
+            refresh_pending: false,
             remote_busy: false,
             auto_fetching: false,
             context_menu: None,
@@ -537,7 +542,9 @@ impl RepoTab {
             }
         } else {
             // No commit was selected. Preserve any standalone diff set from
-            // a staging click or file preview so it survives background refreshes.
+            // a staging click or file preview so it survives background
+            // refreshes (`prune_gone_changes` below closes it if its file
+            // has no changes left).
             if prev_selected_diff.is_some() {
                 self.selected_diff = prev_selected_diff;
                 self.diff_scroll_offset = prev_diff_scroll;
@@ -579,7 +586,7 @@ impl RepoTab {
         self.anchor_unstaged_index =
             prev_anchor_unstaged.filter(|&i| i < self.unstaged_changes.len());
         self.anchor_staged_index = prev_anchor_staged.filter(|&i| i < self.staged_changes.len());
-        self.prune_changes_selection();
+        self.prune_gone_changes();
     }
 
     /// Clear all diff-related state (used when the selected commit disappears
@@ -1153,10 +1160,24 @@ impl GitKraft {
                 // concurrent refresh storms from FileSystemChanged events.  Without
                 // this guard, multiple refreshes could overlap — each opening a full
                 // git2::Repository with mmapped packfiles, causing GB-scale memory use.
-                self.active_tab_mut().is_loading = true;
+                let tab = self.active_tab_mut();
+                tab.is_loading = true;
+                // This load sees every change made so far.
+                tab.refresh_pending = false;
                 refresh(path, depth)
             }
             None => Task::none(),
+        }
+    }
+
+    /// Reload the active tab if the git watcher saw a change while it was
+    /// busy and it is idle now.
+    pub(crate) fn run_pending_refresh(&mut self) -> Task<Message> {
+        let tab = self.active_tab();
+        if tab.refresh_pending && !tab.is_loading {
+            self.refresh_active_tab_quietly()
+        } else {
+            Task::none()
         }
     }
 
@@ -2331,6 +2352,72 @@ mod tests {
         );
     }
 
+    fn working_diff(path: &str) -> DiffInfo {
+        DiffInfo {
+            old_file: path.into(),
+            new_file: path.into(),
+            status: gitkraft_core::FileStatus::Modified,
+            hunks: Vec::new(),
+            old_id: None,
+            new_id: None,
+        }
+    }
+
+    #[test]
+    fn refresh_after_a_commit_closes_the_diff_of_the_committed_file() {
+        // Regression: the diff viewer kept showing the committed file while
+        // the Changes list had no row for it any more.
+        let mut tab = RepoTab::new_empty();
+        setup_loaded_tab(&mut tab, "/tmp/repo");
+        tab.staged_changes = vec![gitkraft_core::DiffFileEntry {
+            old_file: "a.rs".into(),
+            new_file: "a.rs".into(),
+            status: gitkraft_core::FileStatus::Modified,
+        }];
+        tab.selected_staged.insert("a.rs".into());
+        tab.selected_diff = Some(working_diff("a.rs"));
+
+        tab.apply_payload(fake_payload("/tmp/repo"), "/tmp/repo".into());
+
+        assert!(tab.selected_staged.is_empty());
+        assert!(tab.selected_diff.is_none());
+    }
+
+    #[test]
+    fn refresh_keeps_the_diff_of_a_file_still_changed() {
+        let mut tab = RepoTab::new_empty();
+        setup_loaded_tab(&mut tab, "/tmp/repo");
+        tab.selected_diff = Some(working_diff("a.rs"));
+        let mut payload = fake_payload("/tmp/repo");
+        payload.unstaged = vec![gitkraft_core::DiffFileEntry {
+            old_file: "a.rs".into(),
+            new_file: "a.rs".into(),
+            status: gitkraft_core::FileStatus::Modified,
+        }];
+
+        tab.apply_payload(payload, "/tmp/repo".into());
+
+        assert!(tab.selected_diff.is_some());
+    }
+
+    #[test]
+    fn refresh_keeps_a_stash_diff() {
+        // A stash's files are not in the Changes lists; its diff stays.
+        let mut tab = RepoTab::new_empty();
+        setup_loaded_tab(&mut tab, "/tmp/repo");
+        tab.selected_diff = Some(working_diff("a.rs"));
+        tab.commit_files = vec![gitkraft_core::DiffFileEntry {
+            old_file: "a.rs".into(),
+            new_file: "a.rs".into(),
+            status: gitkraft_core::FileStatus::Modified,
+        }];
+        tab.selected_file_index = Some(0);
+
+        tab.apply_payload(fake_payload("/tmp/repo"), "/tmp/repo".into());
+
+        assert!(tab.selected_diff.is_some());
+    }
+
     #[test]
     fn refresh_active_tab_skips_when_already_loading() {
         // When is_loading is true (e.g. a manual Ctrl+R refresh is in flight),
@@ -2866,6 +2953,33 @@ mod tests {
         // Dismissing it still works.
         let _ = state.update(Message::DismissError);
         assert!(state.tabs[0].error_message.is_none());
+    }
+
+    #[test]
+    fn a_change_during_a_load_reloads_once_the_load_is_done() {
+        // Regression: the watcher's event was dropped while a load ran, so a
+        // file saved meanwhile showed up only with the 60 s fallback poll.
+        use crate::message::Message;
+        let mut state = two_repo_tabs();
+        state.active_tab = 0;
+        let done = |state: &mut GitKraft| {
+            let _ = state.update(Message::RepoQuietlyRefreshed(
+                PathBuf::from("/home/user/repo-a"),
+                Ok(fake_payload("/home/user/repo-a")),
+            ));
+        };
+
+        let _ = state.update(Message::FileSystemChanged);
+        let _ = state.update(Message::FileSystemChanged);
+        assert!(state.tabs[0].is_loading);
+        assert!(state.tabs[0].refresh_pending);
+
+        done(&mut state);
+        assert!(state.tabs[0].is_loading, "it reloads for the change");
+        assert!(!state.tabs[0].refresh_pending);
+
+        done(&mut state);
+        assert!(!state.tabs[0].is_loading, "and only once");
     }
 
     #[test]

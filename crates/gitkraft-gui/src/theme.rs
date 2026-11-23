@@ -38,6 +38,13 @@ pub struct ThemeColors {
     pub diff_hunk_bg: Color,
     pub error_bg: Color,
     pub graph_colors: [Color; 8],
+    /// The shape of the design (corner radius, border width, hard shadow, glow); the built-in
+    /// themes keep the classic look, the Dodai themes bring their own.
+    pub design: gitkraft_core::Design,
+    /// Index of the theme in the shared list (what [`shaped`] looks the design up by).
+    pub index: usize,
+    /// The design has a canvas mesh behind the window, so big panels are a little see-through.
+    pub mesh: bool,
 }
 
 /// Clamp a single channel to `[0.0, 1.0]`.
@@ -148,6 +155,77 @@ impl ThemeColors {
             diff_hunk_bg,
             error_bg,
             graph_colors,
+            design: gitkraft_core::Design::default(),
+            index: 0,
+            mesh: false,
+        }
+    }
+
+    /// The same colours with the shape of theme `index`.
+    #[must_use]
+    pub fn with_design(mut self, index: usize) -> Self {
+        self.design = gitkraft_core::design(index);
+        self.index = index;
+        self.mesh = mesh_theme(index).is_some();
+        self
+    }
+
+    /// A corner radius: the classic `builtin` one, or on a Dodai theme its own radius, at most
+    /// `cap` (a toolbar button with a 16 px corner would be a pill).
+    #[must_use]
+    pub fn radius(&self, builtin: f32, cap: f32) -> f32 {
+        if self.design.dodai {
+            self.design.radius.min(cap)
+        } else {
+            builtin
+        }
+    }
+
+    /// `c` as a big panel's fill: a little see-through on a design with a canvas mesh, so the
+    /// mesh shows, else as it is.
+    #[must_use]
+    pub fn wash(&self, c: Color) -> Color {
+        if self.mesh { Color { a: 0.8, ..c } } else { c }
+    }
+
+    /// Does this design cut its corners? Iced boxes cannot, so [`shaped`] draws them.
+    #[must_use]
+    pub fn chamfered(&self) -> bool {
+        self.design.dodai && self.design.chamfer > 0.0
+    }
+
+    /// The border width of boxes and buttons.
+    #[must_use]
+    pub fn border_width(&self) -> f32 {
+        if self.design.dodai {
+            self.design.border_width
+        } else {
+            1.0
+        }
+    }
+
+    /// What lifts a floating box off the page: the design's hard offset shadow, its glow, or the
+    /// soft shadow the built-in themes use (`soft`).
+    #[must_use]
+    pub fn lift(&self, soft: iced::Shadow) -> iced::Shadow {
+        let d = &self.design;
+        if d.hard_shadow > 0.0 {
+            iced::Shadow {
+                color: self.text_primary,
+                offset: iced::Vector::new(d.hard_shadow, d.hard_shadow),
+                blur_radius: 0.0,
+            }
+        } else if d.glow > 0.0 {
+            iced::Shadow {
+                color: Color {
+                    a: 0.45 * d.glow.min(1.0),
+                    ..self.accent
+                },
+                offset: iced::Vector::new(0.0, 0.0),
+                blur_radius: 14.0 * d.glow,
+            }
+        } else {
+            soft
         }
     }
 
@@ -157,20 +235,122 @@ impl ThemeColors {
     /// This keeps backward-compatibility for any code that still holds an
     /// `iced::Theme` value.
     pub fn from_theme(theme: &iced::Theme) -> Self {
-        THEME_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let name = theme.to_string();
-            if let Some((ref cached_name, cached_colors)) = *cache
-                && *cached_name == name
-            {
-                return cached_colors;
-            }
-            let index = gitkraft_core::theme_index_by_name(&name);
-            let colors = Self::from_core(&gitkraft_core::theme_by_index(index));
-            *cache = Some((name, colors));
-            colors
+        use std::fmt::Write;
+        // Every styled widget asks for these colours on every frame, so the lookup must not
+        // allocate: the name is written into a buffer that is reused, and compared with the
+        // last one resolved.
+        thread_local! {
+            static NAME: RefCell<String> = const { RefCell::new(String::new()) };
+        }
+        NAME.with(|name| {
+            let mut name = name.borrow_mut();
+            name.clear();
+            let _ = write!(name, "{theme}");
+            THEME_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some((cached_name, cached_colors)) = &*cache
+                    && *cached_name == *name
+                {
+                    return *cached_colors;
+                }
+                let index = gitkraft_core::theme_index_by_name(&name);
+                let colors =
+                    Self::from_core(&gitkraft_core::theme_by_index(index)).with_design(index);
+                *cache = Some((name.clone(), colors));
+                colors
+            })
         })
     }
+}
+
+// ── The design's canvas mesh ──────────────────────────────────────────────────
+
+/// The Dodai theme at `index` when its design has a canvas mesh (the Dodai family itself).
+fn mesh_theme(index: usize) -> Option<dodai_core::Theme> {
+    let t = gitkraft_core::dodai_id(index).and_then(dodai_core::themes::by_id)?;
+    (t.surface_style.backdrop > 0.0).then_some(t)
+}
+
+const MESH_COLS: usize = 32;
+const MESH_ROWS: usize = 60;
+
+/// The mesh of theme `index` as `MESH_ROWS` × `(MESH_COLS + 1)` colours (cached per theme).
+fn mesh_colors(index: usize) -> Option<std::rc::Rc<Vec<Color>>> {
+    thread_local! {
+        static CACHE: RefCell<Option<(usize, std::rc::Rc<Vec<Color>>)>> = const { RefCell::new(None) };
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((i, v)) = &*cache
+            && *i == index
+        {
+            return Some(v.clone());
+        }
+        let t = mesh_theme(index)?;
+        let (w, h) = (MESH_COLS + 1, MESH_ROWS);
+        let px = dodai_core::backdrop_mesh(&t, w, h)?;
+        let v: std::rc::Rc<Vec<Color>> = std::rc::Rc::new(
+            px.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| Color::from_rgba8(p[0], p[1], p[2], f32::from(p[3]) / 255.0))
+                .collect(),
+        );
+        *cache = Some((index, v.clone()));
+        Some(v)
+    })
+}
+
+#[derive(Debug)]
+struct Mesh(std::rc::Rc<Vec<Color>>);
+
+impl<M> iced::widget::canvas::Program<M> for Mesh {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Fill, Frame, gradient::Linear};
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (cw, rh) = (
+            bounds.width / MESH_COLS as f32,
+            bounds.height / MESH_ROWS as f32,
+        );
+        let stride = MESH_COLS + 1;
+        for row in 0..MESH_ROWS {
+            for col in 0..MESH_COLS {
+                let (a, b) = (self.0[row * stride + col], self.0[row * stride + col + 1]);
+                let x = col as f32 * cw;
+                let g = Linear::new(iced::Point::new(x, 0.0), iced::Point::new(x + cw, 0.0))
+                    .add_stop(0.0, a)
+                    .add_stop(1.0, b);
+                // A hair taller than its row so the rows leave no seam.
+                frame.fill_rectangle(
+                    iced::Point::new(x, row as f32 * rh),
+                    iced::Size::new(cw + 0.5, rh + 0.5),
+                    Fill::from(g),
+                );
+            }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The canvas mesh of the Dodai family, stretched over the window to go under everything;
+/// `None` for the other designs.
+pub fn backdrop<'a, M: 'a>(index: usize) -> Option<iced::Element<'a, M>> {
+    let colors = mesh_colors(index)?;
+    Some(
+        iced::widget::canvas(Mesh(colors))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into(),
+    )
 }
 
 // ── Container styles ──────────────────────────────────────────────────────────
@@ -179,7 +359,7 @@ impl ThemeColors {
 pub fn bg_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
     container::Style {
-        background: Some(Background::Color(c.bg)),
+        background: Some(Background::Color(c.wash(c.bg))),
         ..Default::default()
     }
 }
@@ -197,7 +377,7 @@ pub fn error_banner_style(theme: &iced::Theme) -> container::Style {
 pub fn surface_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
     container::Style {
-        background: Some(Background::Color(c.surface)),
+        background: Some(Background::Color(c.wash(c.surface))),
         ..Default::default()
     }
 }
@@ -206,7 +386,7 @@ pub fn surface_style(theme: &iced::Theme) -> container::Style {
 pub fn sidebar_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
     container::Style {
-        background: Some(Background::Color(c.sidebar_bg)),
+        background: Some(Background::Color(c.wash(c.sidebar_bg))),
         ..Default::default()
     }
 }
@@ -215,7 +395,7 @@ pub fn sidebar_style(theme: &iced::Theme) -> container::Style {
 pub fn header_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
     container::Style {
-        background: Some(Background::Color(c.header_bg)),
+        background: Some(Background::Color(c.wash(c.header_bg))),
         ..Default::default()
     }
 }
@@ -229,17 +409,53 @@ pub fn accent_bar_style(theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// A floating panel's content, with the cut corners of a chamfered Dodai design drawn behind it
+/// (`dodai-iced`'s shaped box). On every other design it is the content unchanged, and
+/// [`context_menu_style`] draws the box.
+pub fn shaped<'a, M: 'a>(
+    content: impl Into<iced::Element<'a, M>>,
+    c: &ThemeColors,
+) -> iced::Element<'a, M> {
+    let content = content.into();
+    let Some(id) = gitkraft_core::dodai_id(c.index).filter(|_| c.chamfered()) else {
+        return content;
+    };
+    let Some(t) = dodai_core::themes::by_id(id) else {
+        return content;
+    };
+    let lc = |x: Color| dodai_core::Color {
+        r: (x.r * 255.0).round() as u8,
+        g: (x.g * 255.0).round() as u8,
+        b: (x.b * 255.0).round() as u8,
+        a: (x.a * 255.0).round() as u8,
+    };
+    dodai_iced::IcedTheme::new(t).shaped_box(
+        content,
+        dodai_iced::BoxStyle {
+            fill: Some(lc(c.surface_highlight)),
+            stroke: Some(lc(c.border)),
+            glow: true,
+            hard_shadow: true,
+            ..dodai_iced::BoxStyle::default()
+        },
+    )
+}
+
 /// Style for the floating context-menu panel.
 pub fn context_menu_style(theme: &iced::Theme) -> container::Style {
     let c = ThemeColors::from_theme(theme);
+    if c.chamfered() {
+        // `shaped` draws the box.
+        return container::Style::default();
+    }
     container::Style {
         background: Some(Background::Color(c.surface_highlight)),
         border: iced::Border {
             color: c.border,
-            width: 1.0,
-            radius: 6.0.into(),
+            width: c.border_width(),
+            radius: c.radius(6.0, 12.0).into(),
         },
-        shadow: iced::Shadow {
+        shadow: c.lift(iced::Shadow {
             color: iced::Color {
                 r: 0.0,
                 g: 0.0,
@@ -248,7 +464,7 @@ pub fn context_menu_style(theme: &iced::Theme) -> container::Style {
             },
             offset: iced::Vector::new(0.0, 4.0),
             blur_radius: 12.0,
-        },
+        }),
         ..Default::default()
     }
 }
@@ -370,14 +586,20 @@ pub fn ghost_button(theme: &iced::Theme, status: button::Status) -> button::Styl
         button::Status::Hovered => button::Style {
             background: Some(Background::Color(c.surface_highlight)),
             text_color: c.text_primary,
-            border: iced::Border::default(),
+            border: iced::Border {
+                radius: c.radius(0.0, 8.0).into(),
+                ..Default::default()
+            },
             shadow: iced::Shadow::default(),
             snap: false,
         },
         button::Status::Pressed => button::Style {
             background: Some(Background::Color(c.border)),
             text_color: c.text_primary,
-            border: iced::Border::default(),
+            border: iced::Border {
+                radius: c.radius(0.0, 8.0).into(),
+                ..Default::default()
+            },
             shadow: iced::Shadow::default(),
             snap: false,
         },
@@ -471,7 +693,7 @@ pub fn context_menu_item(theme: &iced::Theme, status: button::Status) -> button:
             border: iced::Border {
                 color: iced::Color::TRANSPARENT,
                 width: 0.0,
-                radius: 4.0.into(),
+                radius: c.radius(4.0, 8.0).into(),
             },
             shadow: iced::Shadow::default(),
             snap: false,
@@ -535,7 +757,7 @@ pub fn overlay_scrollbar(theme: &iced::Theme, status: scrollable::Status) -> scr
                 a: alpha,
             }),
             border: iced::Border {
-                radius: 3.0.into(),
+                radius: c.radius(3.0, 6.0).into(),
                 ..Default::default()
             },
         },
@@ -566,22 +788,33 @@ pub fn toolbar_button(theme: &iced::Theme, status: button::Status) -> button::St
     let c = ThemeColors::from_theme(theme);
     let border = iced::Border {
         color: c.border,
-        width: 1.0,
-        radius: 4.0.into(),
+        width: c.border_width(),
+        radius: c.radius(4.0, 8.0).into(),
+    };
+    // A Dodai design lifts its buttons: a hard shadow, or a glow on hover.
+    let lift = |hot: bool| {
+        if c.design.hard_shadow > 0.0 || (hot && c.design.glow > 0.0) {
+            c.lift(iced::Shadow::default())
+        } else {
+            iced::Shadow::default()
+        }
     };
     match status {
         button::Status::Active => button::Style {
             background: Some(Background::Color(c.surface)),
             text_color: c.text_primary,
             border,
-            shadow: iced::Shadow::default(),
+            shadow: lift(false),
             snap: false,
         },
         button::Status::Hovered => button::Style {
             background: Some(Background::Color(c.surface_highlight)),
             text_color: c.text_primary,
-            border,
-            shadow: iced::Shadow::default(),
+            border: iced::Border {
+                color: if c.design.dodai { c.accent } else { c.border },
+                ..border
+            },
+            shadow: lift(true),
             snap: false,
         },
         button::Status::Pressed => button::Style {
@@ -616,7 +849,7 @@ pub fn icon_button(theme: &iced::Theme, status: button::Status) -> button::Style
             background: Some(Background::Color(c.surface_highlight)),
             text_color: c.text_primary,
             border: iced::Border {
-                radius: 3.0.into(),
+                radius: c.radius(3.0, 6.0).into(),
                 ..Default::default()
             },
             shadow: iced::Shadow::default(),
@@ -626,7 +859,7 @@ pub fn icon_button(theme: &iced::Theme, status: button::Status) -> button::Style
             background: Some(Background::Color(c.border)),
             text_color: c.text_primary,
             border: iced::Border {
-                radius: 3.0.into(),
+                radius: c.radius(3.0, 6.0).into(),
                 ..Default::default()
             },
             shadow: iced::Shadow::default(),
@@ -978,5 +1211,95 @@ mod tests {
         let regular = ghost_button(&theme, button::Status::Hovered);
         assert!(flat.background.is_none());
         assert!(regular.background.is_some());
+    }
+
+    fn index_of(id: &str) -> usize {
+        gitkraft_settings::theme::DODAI_FIRST
+            + gitkraft_settings::theme::DODAI_IDS
+                .iter()
+                .position(|i| *i == id)
+                .expect("a Dodai theme")
+    }
+
+    #[test]
+    fn a_built_in_theme_keeps_its_classic_shape() {
+        let c = ThemeColors::from_core(&gitkraft_core::theme_by_index(3)).with_design(3);
+        assert!(!c.design.dodai);
+        assert_eq!(c.radius(4.0, 8.0), 4.0);
+        assert_eq!(c.border_width(), 1.0);
+        let soft = iced::Shadow {
+            blur_radius: 12.0,
+            ..Default::default()
+        };
+        assert_eq!(c.lift(soft), soft);
+    }
+
+    #[test]
+    fn a_dodai_theme_brings_its_own_radius_border_and_lift() {
+        let at = |id: &str| {
+            let i = index_of(id);
+            ThemeColors::from_core(&gitkraft_core::theme_by_index(i)).with_design(i)
+        };
+        let material = at("material");
+        assert_eq!(
+            material.radius(4.0, 8.0),
+            8.0,
+            "12 px capped for a small control"
+        );
+        assert_eq!(material.radius(6.0, 16.0), 12.0);
+        let brut = at("neobrutalism");
+        assert_eq!(brut.border_width(), 2.0);
+        let hard = brut.lift(iced::Shadow::default());
+        assert_eq!(hard.blur_radius, 0.0);
+        assert_eq!(hard.offset, iced::Vector::new(4.0, 4.0));
+        let cyber = at("cyberpunk");
+        assert_eq!(
+            cyber.radius(6.0, 12.0),
+            0.0,
+            "chamfered designs are square here"
+        );
+        assert!(
+            cyber.lift(iced::Shadow::default()).blur_radius > 0.0,
+            "a glow"
+        );
+    }
+
+    #[test]
+    fn only_the_dodai_family_has_a_mesh_and_its_panels_let_it_show() {
+        let dodai_dark = gitkraft_core::theme_index_by_name("Dodai · Dark");
+        assert!(dodai_dark >= gitkraft_core::DODAI_FIRST);
+        let dodai = ThemeColors::from_core(&gitkraft_core::theme_by_index(dodai_dark))
+            .with_design(dodai_dark);
+        assert!(dodai.mesh && dodai.wash(dodai.bg).a < 1.0);
+        assert!(backdrop::<()>(dodai_dark).is_some());
+        // Ember, the default, and our other built-ins are plain.
+        for i in 0..gitkraft_core::DODAI_FIRST {
+            let plain = ThemeColors::from_core(&gitkraft_core::theme_by_index(i)).with_design(i);
+            assert!(!plain.mesh && (plain.wash(plain.bg).a - 1.0).abs() < f32::EPSILON);
+            assert!(backdrop::<()>(i).is_none());
+        }
+        let colors = mesh_colors(dodai_dark).expect("mesh");
+        assert_eq!(colors.len(), MESH_ROWS * (MESH_COLS + 1));
+    }
+
+    #[test]
+    fn a_chamfered_design_leaves_its_box_to_the_shaped_frame() {
+        let chamfered = (0..gitkraft_core::THEME_COUNT)
+            .find(|&i| gitkraft_core::design(i).chamfer > 0.0 && gitkraft_core::design(i).dodai)
+            .expect("a chamfered Dodai theme");
+        let c = ThemeColors::from_core(&gitkraft_core::theme_by_index(chamfered))
+            .with_design(chamfered);
+        assert!(c.chamfered());
+        let theme = iced::Theme::Custom(std::sync::Arc::new(iced::theme::Custom::new(
+            gitkraft_core::THEME_NAMES[chamfered].to_string(),
+            iced::theme::Palette::DARK,
+        )));
+        assert!(context_menu_style(&theme).background.is_none());
+        // a classic design is a plain box, drawn by the style
+        assert!(
+            !ThemeColors::from_core(&gitkraft_core::theme_by_index(0))
+                .with_design(0)
+                .chamfered()
+        );
     }
 }

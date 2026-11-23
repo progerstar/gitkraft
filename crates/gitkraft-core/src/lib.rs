@@ -4,7 +4,7 @@
 //!
 //! | Module | What lives here |
 //! |--------|-----------------|
-//! | [`features`] | Git operations and types grouped by feature — repo, branches, commits, diff, staging, remotes, stash, log |
+//! | [`features`] | Git operations and types grouped by feature — repo, branches, commits, diff, staging, remotes, stash, log (settings and theme live in `gitkraft-settings`, re-exported here) |
 //! | [`utils`] | Helpers — relative time formatting, OID formatting, text truncation |
 //!
 //! This crate has NO GUI or TUI dependencies.
@@ -38,8 +38,9 @@ pub use features::repo::{
 };
 pub use features::stash::StashEntry;
 pub use features::theme::{
-    AppTheme, Rgb, SYSTEM_THEME_NAME, THEME_COUNT, THEME_NAMES, current_system_theme_index,
-    detect_system_dark, is_system_name, system_theme_index, theme_by_index, theme_index_by_name,
+    AppTheme, DEFAULT_THEME, DODAI_FIRST, Design, Rgb, SYSTEM_THEME_NAME, THEME_COUNT, THEME_NAMES,
+    current_system_theme_index, design, detect_system_dark, dodai_id, is_system_name,
+    system_dark_cached, system_theme_index, theme_by_index, theme_index_by_name,
 };
 pub use utils::short_oid_str;
 pub use utils::text::{path_basename, truncate_str};

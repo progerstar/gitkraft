@@ -34,6 +34,20 @@ pub struct CommitPage {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    // ── Hub (pull requests, issues, CI, pulse, notifications) ─────────────
+    /// A message of the hub screen.
+    Hub(crate::features::hub::HubMessage),
+
+    // ── Tray and background ───────────────────────────────────────────────
+    /// A click on the tray menu.
+    Tray(crate::tray::TrayCommand),
+    /// Put the icon in the tray if it is not there, and show the menu the current state.
+    TrayRefresh,
+    /// The window was asked to close.
+    CloseRequested,
+    /// Started at login: bring the hub up behind the hidden window so the schedule runs.
+    BackgroundStart,
+
     // ── Tabs ──────────────────────────────────────────────────────────────
     /// User clicked a tab in the tab bar.
     SwitchTab(usize),
@@ -51,6 +65,14 @@ pub enum Message {
     RepoSelected(Option<PathBuf>),
     /// Folder picker returned a path for init (or was cancelled → `None`).
     RepoInitSelected(Option<PathBuf>),
+    /// The clone field changed.
+    CloneSpecChanged(String),
+    /// User clicked "Clone" — pick the folder to clone into.
+    CloneRepo,
+    /// Folder picker returned the parent folder of the clone (or was cancelled → `None`).
+    CloneDestSelected(Option<PathBuf>),
+    /// The clone finished: the new checkout, or what went wrong.
+    Cloned(Result<PathBuf, String>),
     /// Async repo-open completed.
     RepoOpened(Result<RepoPayload, String>),
     /// User requested a full refresh of the current repo.
@@ -166,10 +188,12 @@ pub enum Message {
     CommitCreated(Result<(), String>),
     /// User edited the multi-line commit description.
     CommitDescriptionAction(iced::widget::text_editor::Action),
-    /// User clicked the AI button: generate a message from the staged diff.
+    /// User clicked the AI button: generate a message from the staged diff
+    /// (with the agent command or the AI API, as `settings.json` says).
     GenerateCommitMessage,
-    /// AI message generation finished for the repo at this path.
-    CommitMessageGenerated(PathBuf, Result<String, String>),
+    /// AI message generation finished for the repo at this path: the message
+    /// and the style rules it breaks (the API reports those).
+    CommitMessageGenerated(PathBuf, Result<(String, Vec<String>), String>),
     /// User toggled the "Push after commit" checkbox.
     TogglePushAfterCommit(bool),
     /// Background save of the "Push after commit" setting completed.

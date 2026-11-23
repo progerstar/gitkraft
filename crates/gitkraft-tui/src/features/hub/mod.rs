@@ -1,0 +1,13 @@
+//! The hub: pull requests, issues, CI, notifications and pulse of every platform account.
+
+pub mod agents;
+pub mod agents_view;
+pub mod drag;
+pub mod events;
+pub mod images;
+pub mod list;
+pub mod logview;
+pub mod markdown;
+pub mod palette;
+pub mod state;
+pub mod view;

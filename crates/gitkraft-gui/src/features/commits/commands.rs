@@ -168,23 +168,13 @@ pub(crate) fn create_commit(path: PathBuf, message: String) -> Task<Message> {
     )
 }
 
-/// Ask the configured agent command for a commit message for the staged diff.
+/// Ask for a commit message for the staged diff, from the generator chosen in
+/// `settings.json` (`commit_message_backend`: the agent command or the AI API).
 pub(crate) fn generate_commit_message(path: PathBuf) -> Task<Message> {
     let reply_path = path.clone();
     git_task!(
         move |result| Message::CommitMessageGenerated(reply_path.clone(), result),
-        (|| {
-            let repo = open_repo!(&path);
-            let patch = gitkraft_core::features::commits::staged_patch(&repo).str_err()?;
-            let workdir = repo.workdir().ok_or("bare repository")?.to_path_buf();
-            let command = gitkraft_core::features::persistence::load_settings()
-                .ok()
-                .and_then(|s| s.commit_message_command)
-                .filter(|c| !c.trim().is_empty())
-                .unwrap_or_else(|| gitkraft_core::DEFAULT_COMMIT_MESSAGE_COMMAND.to_string());
-            gitkraft_core::features::commits::generate_commit_message(&workdir, &command, &patch)
-                .str_err()
-        })()
+        gitkraft_hub::commit_ai::generate_blocking(&path)
     )
 }
 

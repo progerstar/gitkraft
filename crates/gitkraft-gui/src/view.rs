@@ -41,6 +41,9 @@ use crate::widgets;
 impl GitKraft {
     /// Top-level view — called by the Iced runtime on every frame.
     pub fn view(&self) -> Element<'_, Message> {
+        if self.hub.is_some() && !self.hub_hidden {
+            return features::hub::view::view(self);
+        }
         let c = self.colors();
 
         // ── Tab bar (always visible) ──────────────────────────────────────
@@ -70,7 +73,11 @@ impl GitKraft {
                 .style(theme::bg_style)
                 .into();
             let about = self.show_about.then(|| widgets::about::view(self));
-            return with_overlays(welcome_screen, [about]);
+            return with_overlays(
+                theme::backdrop(self.current_theme_index),
+                welcome_screen,
+                [about],
+            );
         }
 
         let tab = self.active_tab();
@@ -265,7 +272,7 @@ impl GitKraft {
             .on_right_press(Message::CloseContextMenu);
 
             let (cx, cy) = self.active_tab().context_menu_pos;
-            let menu_content = context_menu_panel(self, &c);
+            let menu_content = theme::shaped(context_menu_panel(self, &c), &c);
 
             let positioned = crate::widgets::bounded_popup::bounded_popup(
                 menu_content,
@@ -283,23 +290,32 @@ impl GitKraft {
         });
 
         let about = self.show_about.then(|| widgets::about::view(self));
-        with_overlays(ma, [search, branch_popup, menu, about])
+        with_overlays(
+            theme::backdrop(self.current_theme_index),
+            ma,
+            [search, branch_popup, menu, about],
+        )
     }
 }
 
-/// Layer the open `overlays` over `base`.
+/// Layer the open `overlays` over `base`, and the theme's `backdrop` (the
+/// Dodai family's gradient mesh) under it.
 ///
-/// The result is always a stack holding `base` and then one layer per
-/// overlay slot, with empty space standing in for a closed overlay. iced keeps
+/// The result is always a stack holding the backdrop, `base` and then one
+/// layer per overlay slot, with empty space standing in for a missing
+/// backdrop or a closed overlay. iced keeps
 /// widget state such as scroll offsets by position in the widget tree, so
 /// wrapping `base` in a stack only while an overlay is open would rebuild all
 /// state under it: opening a context menu would scroll every list to the top.
 /// Fixed slots also keep one overlay's state when another opens or closes.
 fn with_overlays<'a, const N: usize>(
+    backdrop: Option<Element<'a, Message>>,
     base: Element<'a, Message>,
     overlays: [Option<Element<'a, Message>>; N],
 ) -> Element<'a, Message> {
-    let layers = std::iter::once(base)
+    let backdrop = backdrop.unwrap_or_else(|| Space::new().into());
+    let layers = [backdrop, base]
+        .into_iter()
         .chain(
             overlays
                 .into_iter()
@@ -800,7 +816,7 @@ fn search_overlay<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Messa
         .width(Length::Fill)
         .height(Length::Fill);
 
-        container(content)
+        container(theme::shaped(content, c))
             .width(sw(1100.0))
             .height(sh(600.0))
             .style(theme::context_menu_style)
@@ -918,7 +934,7 @@ fn search_overlay<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Messa
         .width(Length::Fill)
         .height(Length::Fill);
 
-        container(content)
+        container(theme::shaped(content, c))
             .width(1100)
             .height(600)
             .style(theme::context_menu_style)
@@ -926,7 +942,7 @@ fn search_overlay<'a>(state: &'a GitKraft, c: &ThemeColors) -> Element<'a, Messa
             .into()
     } else {
         // No commit selected yet — just show the search panel
-        container(left_panel)
+        container(theme::shaped(left_panel, c))
             .width(sw(700.0))
             .height(sh(500.0))
             .style(theme::context_menu_style)

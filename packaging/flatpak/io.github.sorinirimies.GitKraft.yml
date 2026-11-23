@@ -4,7 +4,7 @@
 # scripts/ci/update_flathub.nu.
 app-id: io.github.sorinirimies.GitKraft
 runtime: org.freedesktop.Platform
-runtime-version: '24.08'
+runtime-version: '26.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -18,6 +18,9 @@ finish-args:
   - --device=dri
   - --socket=ssh-auth
   - --filesystem=home
+  # Tray icon (StatusNotifierItem); start at login goes through the Background portal.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.Notifications
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -38,6 +41,6 @@ modules:
     sources:
       - type: git
         url: https://github.com/sorinirimies/gitkraft.git
-        tag: v1.2.1
-        commit: 0000000000000000000000000000000000000000
+        tag: v1.6.0
+        commit: 7a8df48a8da5c331a69284fc78fd74daa80c4f11
       - cargo-sources.json

@@ -13,11 +13,12 @@ keywords = ["git", "vcs", "ide", "repository"]
 
 [dependencies]
 git2          = { workspace = true }
+gitkraft-settings = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 chrono        = { workspace = true }
-dirs          = { workspace = true }
 anyhow        = { workspace = true }
+dirs          = { workspace = true }   # home folder: agent CLIs in ~/.local/bin, Lite XL
 tracing       = { workspace = true }
 notify        = { workspace = true }
 tempfile      = { workspace = true }   # used for atomic settings writes

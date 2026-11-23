@@ -36,15 +36,20 @@ the [original README](https://github.com/sorinirimies/gitkraft#readme).
   stops answering is dropped after about a minute.
 - **Image diffs.** PNG, JPEG, GIF, WebP, BMP, ICO and SVG are shown before / after, side by
   side, with pixel and file sizes. SVG can be switched to its text diff.
-- **AI commit message.** The ✨ button sends the staged changes (a list of all files plus
-  their diffs, shortened if huge) to an AI agent CLI and fills in *Summary* and
-  *Description*. Default: Claude Code with the Haiku model.
+- **AI commit message.** The ✨ button fills in *Summary* and *Description* for the staged
+  changes. By default it sends them (a list of all files plus their diffs, shortened if
+  huge) to an AI agent CLI: Claude Code with the Haiku model. With
+  `"commit_message_backend": "api"` it uses the original's AI API instead (Anthropic or an
+  OpenAI-compatible endpoint, styled by `.gitkraft/ai.toml`). The TUI's draft key follows
+  the same setting.
 - **Commit box** with a multi-line *Description*, *Commit to ‹branch›* and an optional
   **Push after commit**.
 - **Safer discard.** The trash button asks for confirmation; for a new file it offers to
   delete it.
 - **Themes:** *Ember* (default, dark with an orange accent), *Classic* (the original),
-  *Desk Dark* and *Desk Light*. *System* follows the OS between the two *Desk* themes.
+  *Desk Dark* and *Desk Light*, then the original's Dodai design families (Dodai,
+  Cyberpunk, Material 3, Neo-Brutalism). *System* follows the OS between the two *Desk*
+  themes.
 - **Small things:** *Lite XL* in the editor list, a *Copy* button on error banners, the
   folder picker opens on top of the window.
 
@@ -57,6 +62,12 @@ In the GUI `settings.json` (open it with **Ctrl/Cmd + ,**):
   // Command that receives the staged changes on stdin and prints the commit message.
   // Run through `sh -c`. Default: claude -p --model haiku "<prompt>"
   "commit_message_command": "claude -p --model sonnet 'Write a git commit message for this diff'",
+
+  // Where the ✨ button gets the message: "agent" (default) runs commit_message_command,
+  // "api" calls the AI API. Its key comes from ANTHROPIC_API_KEY / OPENAI_API_KEY or
+  // `gitkraft-tui ai-key anthropic` (system keyring); GITKRAFT_AI_PROVIDER,
+  // GITKRAFT_AI_MODEL and GITKRAFT_AI_BASE_URL pick the provider, model and endpoint.
+  "commit_message_backend": "agent",
 
   // Remembered state of the "Push after commit" checkbox.
   "push_after_commit": false,
@@ -113,15 +124,19 @@ git merge upstream/main
   (например, `gh`) и SSH-агент, а при ошибке показывается сообщение самого git.
 - **Изменения в картинках.** PNG, JPEG, GIF, WebP, BMP, ICO и SVG показываются «было /
   стало» рядом, с размерами в пикселях и байтах. SVG можно переключить на текстовый дифф.
-- **Сообщение коммита от ИИ.** Кнопка ✨ отправляет staged-изменения (список всех файлов и
-  их диффы, слишком большие — укороченными) в CLI ИИ-агента и заполняет *Summary* и
-  *Description*. По умолчанию — Claude Code с моделью Haiku.
+- **Сообщение коммита от ИИ.** Кнопка ✨ заполняет *Summary* и *Description* по
+  staged-изменениям. По умолчанию отправляет их (список всех файлов и их диффы, слишком
+  большие — укороченными) в CLI ИИ-агента: Claude Code с моделью Haiku. С
+  `"commit_message_backend": "api"` вместо этого идёт в AI API оригинала (Anthropic или
+  OpenAI-совместимый сервер, стиль задаёт `.gitkraft/ai.toml`). Клавиша черновика в TUI
+  следует той же настройке.
 - **Панель коммита** с многострочным *Description*, кнопкой *Commit to ‹ветка›* и галочкой
   **Push after commit** (push сразу после коммита).
 - **Безопасная отмена изменений.** Корзина спрашивает подтверждение; для нового файла
   предлагает его удалить.
 - **Темы:** *Ember* (по умолчанию, тёмная с оранжевым акцентом), *Classic* (оригинальная),
-  *Desk Dark* и *Desk Light*. *System* переключает две темы *Desk* вслед за системой.
+  *Desk Dark* и *Desk Light*, за ними семейства Dodai из оригинала (Dodai, Cyberpunk,
+  Material 3, Neo-Brutalism). *System* переключает две темы *Desk* вслед за системой.
 - **Мелочи:** *Lite XL* в списке редакторов, кнопка «копировать» у сообщений об ошибках,
   окно выбора папки открывается поверх программы.
 
@@ -132,6 +147,11 @@ git merge upstream/main
 
 - `commit_message_command` — команда, которая получает изменения на stdin и печатает
   сообщение коммита (по умолчанию `claude -p --model haiku "…"`);
+- `commit_message_backend` — откуда кнопка ✨ берёт сообщение: `"agent"` (по умолчанию,
+  команда выше) или `"api"` (AI API; ключ — из `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` или
+  сохранённый командой `gitkraft-tui ai-key anthropic` в системном хранилище ключей;
+  провайдер, модель и адрес — `GITKRAFT_AI_PROVIDER`, `GITKRAFT_AI_MODEL`,
+  `GITKRAFT_AI_BASE_URL`);
 - `push_after_commit` — состояние галочки *Push after commit*;
 - `layout_style` — `"two-pane"` (по умолчанию) или `"classic"`.
 

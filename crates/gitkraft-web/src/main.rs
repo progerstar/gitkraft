@@ -1,0 +1,171 @@
+//! `gitkraft-web` — GitKraft on localhost.
+//!
+//! Binds `127.0.0.1:3333`; `--host`, `--port` override; `--no-open` keeps the browser closed.
+
+use gitkraft_hub::Hub;
+use gitkraft_platforms::{CachedClient, DynClient, ReqwestClient};
+use gitkraft_settings::dashboard::Dashboard;
+use gitkraft_settings::files;
+use gitkraft_web::{Paths, ServerOptions, Session, serve};
+
+const USAGE: &str = "usage: gitkraft-web [--host HOST] [--port PORT] [--no-open] [--checkout DIR]... [--demo] [--theme N] [--version]";
+
+fn parse_args(args: &[String]) -> Result<ServerOptions, String> {
+    let mut opts = ServerOptions {
+        open_browser: true,
+        ..ServerOptions::default()
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--host" => opts.host = it.next().ok_or("--host needs a value")?.clone(),
+            "--port" => {
+                opts.port = it
+                    .next()
+                    .ok_or("--port needs a value")?
+                    .parse()
+                    .map_err(|_| "--port must be a number")?
+            }
+            "--no-open" => opts.open_browser = false,
+            "--demo" => opts.demo = true,
+            "--theme" => {
+                opts.theme = Some(
+                    it.next()
+                        .ok_or("--theme needs a value")?
+                        .parse()
+                        .map_err(|_| "--theme must be a number")?,
+                )
+            }
+            "--checkout" => opts
+                .checkouts
+                .push(it.next().ok_or("--checkout needs a directory")?.into()),
+            "-h" | "--help" => return Err(USAGE.into()),
+            other => return Err(format!("unknown option '{other}'\n{USAGE}")),
+        }
+    }
+    Ok(opts)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("gitkraft-web {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let opts = parse_args(&args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    if opts.demo {
+        // Made-up data and no files of the user's: for a first look and for screenshots.
+        let session = Session::new(
+            gitkraft_hub::demo::hub(),
+            Dashboard::starter(),
+            Paths {
+                // The repository you start in, to browse (changes are refused in a demo).
+                checkouts: vec![std::path::PathBuf::from(".")],
+                ..Paths::none()
+            },
+            opts.theme
+                .unwrap_or(gitkraft_settings::theme::DEFAULT_THEME),
+        );
+        session.demo();
+        return serve(session, opts).await.map_err(Into::into);
+    }
+    let read = |p: anyhow::Result<std::path::PathBuf>| {
+        p.ok().and_then(|p| files::read_optional(&p).ok().flatten())
+    };
+    let dashboard = match read(files::dashboard_path()) {
+        Some(text) => {
+            Dashboard::parse(&text).map_err(|e| anyhow::anyhow!("dashboard.toml: {e}"))?
+        }
+        None => Dashboard::starter(),
+    };
+    // The checkout we were started in, plus the repos the dashboard names.
+    let repos: Vec<String> = dashboard
+        .sections
+        .iter()
+        .flat_map(|s| s.repos.iter().cloned())
+        .collect();
+    let accounts = tokio::task::spawn_blocking(move || {
+        gitkraft_hub::accounts::discover_for(std::path::Path::new("."), &repos)
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if accounts.is_empty() {
+        eprintln!(
+            "gitkraft-web: no accounts found; set GITHUB_TOKEN / GITLAB_TOKEN / CODEBERG_TOKEN or log in with `gh`"
+        );
+    }
+    let client = DynClient::new(std::sync::Arc::new(CachedClient::new(
+        ReqwestClient::new().map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    )));
+    let hub = Hub::new(accounts, &client).with_wiki_git(gitkraft_hub::wiki_git::WikiGit::system());
+    let theme = gitkraft_settings::persistence::load_settings()
+        .map(|s| s.theme_index())
+        .unwrap_or(gitkraft_settings::theme::DEFAULT_THEME);
+    let mut paths = Paths::user();
+    paths.checkouts.extend(opts.checkouts.iter().cloned());
+    let theme = opts.theme.unwrap_or(theme);
+    serve(Session::new(hub, dashboard, paths, theme), opts).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(a: &[&str]) -> Result<ServerOptions, String> {
+        parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn defaults_and_flags() {
+        let d = p(&[]).expect("ok");
+        assert_eq!(
+            (d.host.as_str(), d.port, d.open_browser),
+            ("127.0.0.1", 3333, true)
+        );
+        let o = p(&["--host", "0.0.0.0", "--port", "8080", "--no-open"]).expect("ok");
+        assert_eq!(
+            (o.host.as_str(), o.port, o.open_browser),
+            ("0.0.0.0", 8080, false)
+        );
+    }
+
+    #[test]
+    fn demo_and_theme_flags() {
+        let o = p(&["--demo", "--theme", "44"]).expect("ok");
+        assert!(o.demo);
+        assert_eq!(o.theme, Some(44));
+        assert!(p(&["--theme", "x"]).expect_err("bad").contains("number"));
+    }
+
+    #[test]
+    fn checkouts_can_be_given_more_than_once() {
+        let o = p(&["--checkout", "/a", "--checkout", "/b"]).expect("ok");
+        assert_eq!(o.checkouts, [std::path::PathBuf::from("/a"), "/b".into()]);
+        assert!(
+            p(&["--checkout"])
+                .expect_err("missing")
+                .contains("needs a directory")
+        );
+    }
+
+    #[test]
+    fn bad_flags_explain_themselves() {
+        assert!(
+            p(&["--port"])
+                .expect_err("missing")
+                .contains("needs a value")
+        );
+        assert!(p(&["--port", "x"]).expect_err("bad").contains("number"));
+        assert!(
+            p(&["--bogus"])
+                .expect_err("unknown")
+                .contains("unknown option")
+        );
+        assert!(p(&["--help"]).expect_err("help").starts_with("usage"));
+    }
+}

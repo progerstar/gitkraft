@@ -1,5 +1,11 @@
 [workspace]
 members = [
+    "crates/gitkraft-web",
+    "crates/gitkraft-mcp",
+    "crates/gitkraft-hub",
+    "crates/gitkraft-ci",
+    "crates/gitkraft-platforms",
+    "crates/gitkraft-settings",
     "crates/gitkraft-core",
     "crates/gitkraft-gui",
     "crates/gitkraft-tui",
@@ -7,9 +13,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version      = "1.4.1"
+version      = "1.6.1"
 edition      = "2024"
-rust-version = "1.90"
+rust-version = "1.91"
 authors      = ["Sorin Irimies <sorinirimies@gmail.com>"]
 license      = "MIT"
 repository   = "https://github.com/sorinirimies/gitkraft"
@@ -19,11 +25,15 @@ repository   = "https://github.com/sorinirimies/gitkraft"
 # `{ workspace = true }` so there is a single source of truth.
 
 [workspace.dependencies]
+dodai-iced = { version = "0.1.6", default-features = false, features = ["icons"] }
+dodai-core = { version = "0.1.6", features = ["cyberpunk", "material", "neobrutalism", "dodai"] }
 # Core / shared
 git2         = { version = "0.21", features = ["vendored-openssl"] }
 anyhow       = "1"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
+clap         = { version = "4", features = ["derive"] }
+clap_complete = "4"
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "7.0"
 
@@ -31,10 +41,20 @@ notify       = { version = "8.2.1", features = [] }
 futures      = "0.3"
 tempfile     = "3"
 tracing            = "0.1"
+thiserror    = "2"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest      = { version = "0.13", default-features = false, features = ["rustls", "http2", "gzip"] }
+notify-rust  = "4"
+toml         = "1"
+topcoat      = "0.10"
+rmcp         = { version = "3.9", features = ["server", "macros", "schemars", "transport-io"] }
+schemars     = "1"
+toml_edit    = "0.25"
+sha2         = "0.10"
+base64       = "0.22"
 
 # GUI (Iced)
-iced         = { version = "0.14", features = ["advanced", "canvas", "image", "svg"] }
-image        = { version = "0.25", default-features = false }  # image-diff dimensions (codecs come via iced)
+iced         = { version = "0.14", features = ["advanced", "canvas", "image", "svg", "tokio"] }
 iced_fonts   = { version = "0.3", features = ["bootstrap"] }
 rfd          = "0.17"
 winresource  = { version = "0.1", default-features = false }  # gitkraft.exe icon (build script)
@@ -47,9 +67,17 @@ tui-file-explorer    = { version = "4", default-features = false }
 tui-spinner          = "0.5.1"
 tui-skeleton         = "0.3.0"
 tui-nuances          = "0.1.11"
+tui-chart            = "0.6"
+tui-checkbox       = "0.6"
+ratatui-image        = { version = "11.1", default-features = false, features = ["crossterm"] }
+image                = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }  # TUI previews, GUI image-diff dimensions
 
 # Internal crates
-gitkraft-core = { path = "crates/gitkraft-core", version = "1.4.1" }
+gitkraft-hub = { path = "crates/gitkraft-hub", version = "1.6.1" }
+gitkraft-ci = { path = "crates/gitkraft-ci", version = "1.6.1" }
+gitkraft-platforms = { path = "crates/gitkraft-platforms", version = "1.6.1" }
+gitkraft-settings = { path = "crates/gitkraft-settings", version = "1.6.1" }
+gitkraft-core = { path = "crates/gitkraft-core", version = "1.6.1" }
 
 [workspace.lints.rust]
 # libgit2 settings and AppKit need unsafe: each use allows it with a reason.

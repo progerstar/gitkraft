@@ -8,11 +8,20 @@
 //!
 //! Call [`run`] with an optional repository path to start the TUI application.
 
+pub mod agents_cli;
+pub mod ai_cli;
+pub mod anim;
 pub mod app;
+pub mod auth_cli;
+pub mod autostart_cli;
 pub mod cli;
+pub mod clone_cli;
 pub mod events;
 pub mod features;
+pub mod forge_cli;
 pub mod layout;
+pub mod notify_cli;
+pub mod ssh_cli;
 pub mod utils;
 pub mod widgets;
 
@@ -22,7 +31,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -82,6 +91,7 @@ pub fn run(mut repo_path: Option<PathBuf>) -> Result<()> {
 
     // Always pop the keyboard enhancement flags so the terminal is left clean.
     let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    let _ = execute!(io::stdout(), DisableMouseCapture);
 
     restore_terminal()?;
     terminal.show_cursor()?;
@@ -127,6 +137,8 @@ where
         }
     }
 
+    let mut mouse_captured = false;
+
     // Watcher thread handle — restarted whenever it exits or the repo changes.
     let mut git_watcher_thread: Option<std::thread::JoinHandle<()>> = None;
 
@@ -135,6 +147,24 @@ where
 
         // Drain any results from background tasks before drawing.
         app.poll_background();
+        if let Some(hub) = app.hub.as_mut() {
+            hub.poll();
+        }
+
+        // The mouse is captured only on the hub screen: elsewhere the terminal
+        // keeps its own text selection.
+        let want_mouse = matches!(
+            app.screen,
+            crate::app::AppScreen::Hub | crate::app::AppScreen::Main
+        ) || app.menu.is_open();
+        if want_mouse != mouse_captured {
+            let _ = if want_mouse {
+                execute!(io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(io::stdout(), DisableMouseCapture)
+            };
+            mouse_captured = want_mouse;
+        }
 
         // Track OS light/dark changes while the theme follows the system.
         app.refresh_system_theme();
@@ -167,12 +197,17 @@ where
         // Use a shorter poll interval (33 ms ≈ 30 fps) so background-task
         // results are picked up promptly and the loading indicator updates
         // without a noticeable lag.
-        if event::poll(Duration::from_millis(33))?
-            && let Event::Key(key) = event::read()?
-        {
-            // Ignore key-release events on platforms that send them
-            if key.kind == crossterm::event::KeyEventKind::Press {
-                events::handle_key(&mut app, key);
+        if event::poll(Duration::from_millis(33))? {
+            // Handle everything that is waiting, then draw once. With the mouse captured, motion
+            // events arrive by the dozen; drawing after each one made the screen trail behind
+            // the pointer and every key press wait for the redraws of the events before it.
+            let mut budget = 512;
+            loop {
+                handle_event(&mut app, event::read()?);
+                budget -= 1;
+                if budget == 0 || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
 
@@ -253,6 +288,14 @@ where
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen)?;
             terminal.clear()?;
+
+            // A wiki page edited in the terminal editor goes back to the platform now.
+            if std::mem::take(&mut app.upload_wiki_after_editor)
+                && opened
+                && let Some(hub) = app.hub.as_mut()
+            {
+                hub.upload_wiki_draft();
+            }
         }
         // ─────────────────────────────────────────────────────────────────
 
@@ -270,4 +313,30 @@ fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// One terminal event, routed to the screen it belongs to.
+fn handle_event(app: &mut crate::app::App, event: Event) {
+    match event {
+        Event::Key(key) => {
+            // Ignore key-release events on platforms that send them
+            if key.kind == crossterm::event::KeyEventKind::Press {
+                events::handle_key(app, key);
+            }
+        }
+        Event::Mouse(mouse) if app.menu.is_open() => {
+            features::mouse::handle(app, mouse);
+        }
+        Event::Mouse(mouse) if app.screen == crate::app::AppScreen::Hub => {
+            if app.show_editor_panel {
+                features::mouse::editor_mouse(app, mouse);
+            } else {
+                features::hub::events::handle_mouse(app, mouse);
+            }
+        }
+        Event::Mouse(mouse) if app.screen == crate::app::AppScreen::Main => {
+            features::mouse::handle(app, mouse);
+        }
+        _ => {}
+    }
 }

@@ -673,10 +673,28 @@ pub struct GitKraft {
     // ── Persistence ───────────────────────────────────────────────────────
     /// Recently opened repositories (loaded from settings on startup).
     pub recent_repos: Vec<gitkraft_core::RepoHistoryEntry>,
+    /// What the welcome screen's clone field holds: `owner/name`, `host/owner/name` or a URL.
+    pub clone_spec: String,
 
     // ── About ─────────────────────────────────────────────────────────────
     /// Whether the About dialog is visible.
     pub show_about: bool,
+    /// The hub screen (pull requests, issues, CI, pulse), when open.
+    pub hub: Option<Box<crate::features::hub::HubState>>,
+    /// The hub keeps running (its scheduler too) but the main screen is shown.
+    pub hub_hidden: bool,
+
+    // ── Tray and background ───────────────────────────────────────────────
+    /// Start GitKraft at login (mirrors the login entry).
+    pub autostart: bool,
+    /// Show the tray icon.
+    pub tray_icon: bool,
+    /// Closing the window hides it to the tray.
+    pub close_to_tray: bool,
+    /// The tray icon exists.
+    pub tray_on: bool,
+    /// Started with `--background`: the window begins hidden.
+    pub background: bool,
 
     // ── Search ────────────────────────────────────────────────────────────
     /// Whether the search overlay is visible.
@@ -751,6 +769,11 @@ impl GitKraft {
     fn from_settings(settings: gitkraft_core::AppSettings) -> Self {
         let follow_system = settings.follow_system_theme();
         let current_theme_index = settings.theme_index();
+        let (autostart, tray_icon, close_to_tray) = (
+            settings.autostart,
+            settings.tray_icon,
+            settings.close_to_tray,
+        );
 
         let recent_repos = settings.recent_repos;
 
@@ -809,8 +832,16 @@ impl GitKraft {
             follow_system,
 
             recent_repos,
+            clone_spec: String::new(),
 
             show_about: false,
+            hub: None,
+            hub_hidden: false,
+            autostart,
+            tray_icon,
+            close_to_tray,
+            tray_on: false,
+            background: false,
             search_visible: false,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -847,20 +878,7 @@ impl GitKraft {
             editor: settings
                 .editor_name
                 .as_deref()
-                .map(|name| {
-                    // Try to map persisted name back to Editor variant
-                    gitkraft_core::EDITOR_NAMES
-                        .iter()
-                        .position(|n| n.eq_ignore_ascii_case(name))
-                        .map(gitkraft_core::Editor::from_index)
-                        .unwrap_or_else(|| {
-                            if name.eq_ignore_ascii_case("none") {
-                                gitkraft_core::Editor::None
-                            } else {
-                                gitkraft_core::Editor::Custom(name.to_string())
-                            }
-                        })
-                })
+                .map(gitkraft_core::Editor::from_name)
                 .unwrap_or_else(detect_system_editor),
 
             preview_editor: None,
@@ -1034,6 +1052,7 @@ impl GitKraft {
     /// ```
     pub fn colors(&self) -> ThemeColors {
         ThemeColors::from_core(&gitkraft_core::theme_by_index(self.current_theme_index))
+            .with_design(self.current_theme_index)
     }
 
     /// Return a **custom** `iced::Theme` whose `Palette` is derived from the
@@ -1228,6 +1247,7 @@ impl GitKraft {
             window_maximized: None, // not tracked
             commit_ref_width: Some(self.commit_ref_width),
             commit_graph_width: Some(self.commit_graph_width),
+            hub_list_percent: None, // TUI-only
         }
     }
 }
@@ -1296,9 +1316,11 @@ mod tests {
 
     #[test]
     fn colors_returns_theme_colors() {
-        let state = GitKraft::new();
+        let mut state = GitKraft::new();
+        // Pin the theme: `new()` reads the saved settings, which may be a light one.
+        state.current_theme_index = gitkraft_core::DEFAULT_THEME;
         let c = state.colors();
-        // The default theme (index 0) is dark, so background should be dark
+        // The default theme (Dodai Dark) is dark, so the background should be dark.
         assert!(c.bg.r < 0.5);
     }
 
@@ -3262,6 +3284,53 @@ mod tests {
             tab.commit_message, "WIP: fixing the bug",
             "commit_message must survive background repo refreshes"
         );
+    }
+
+    #[test]
+    fn a_generated_message_fills_summary_and_description_and_reports_warnings() {
+        use crate::message::Message;
+        let mut state = GitKraft::new();
+        let path = std::path::PathBuf::from("/tmp/repo");
+        state.active_tab_mut().repo_path = Some(path.clone());
+        let _ = state.update(Message::CommitMessageGenerated(
+            path,
+            Ok((
+                "feat(ui): add a draft button\n\nExplains why.".to_string(),
+                vec!["subject is long".to_string()],
+            )),
+        ));
+        let tab = state.active_tab();
+        assert_eq!(tab.commit_message, "feat(ui): add a draft button");
+        assert_eq!(tab.commit_description.text().trim(), "Explains why.");
+        let status = tab.status_message.clone().unwrap_or_default();
+        assert!(status.contains("subject is long"), "{status}");
+    }
+
+    #[test]
+    fn a_failed_generation_is_an_error_and_leaves_what_the_user_typed() {
+        use crate::message::Message;
+        let mut state = GitKraft::new();
+        let path = std::path::PathBuf::from("/tmp/repo");
+        state.active_tab_mut().repo_path = Some(path.clone());
+        state.active_tab_mut().commit_message = "mine".into();
+        let _ = state.update(Message::CommitMessageGenerated(path, Err("no key".into())));
+        let tab = state.active_tab();
+        assert_eq!(tab.commit_message, "mine");
+        assert!(
+            tab.error_message
+                .clone()
+                .unwrap_or_default()
+                .contains("no key")
+        );
+    }
+
+    #[test]
+    fn generating_needs_staged_changes() {
+        use crate::message::Message;
+        let mut state = GitKraft::new();
+        state.active_tab_mut().repo_path = Some(std::path::PathBuf::from("/tmp/fake-repo"));
+        let _ = state.update(Message::GenerateCommitMessage);
+        assert!(!state.active_tab().generating_commit_message);
     }
 
     // ── PreviewFile / OpenFiles message tests ─────────────────────────────

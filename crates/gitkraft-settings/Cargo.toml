@@ -1,0 +1,26 @@
+[package]
+name = "gitkraft-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Settings, layout, repo history and theme data for GitKraft (no git2, no UI)"
+categories = ["development-tools", "config"]
+keywords = ["git", "settings", "theme"]
+
+[dependencies]
+serde      = { workspace = true }
+dodai-core = { workspace = true }   # the Dodai design system: 62 themes and their shape tokens
+serde_json = { workspace = true }
+chrono     = { workspace = true }
+dirs       = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+tempfile   = { workspace = true }   # atomic settings writes
+toml       = { workspace = true }
+toml_edit  = { workspace = true }   # flip `enabled` without losing comments
+
+[lints]
+workspace = true

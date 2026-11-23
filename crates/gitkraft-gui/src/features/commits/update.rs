@@ -342,12 +342,16 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             tab.generating_commit_message = false;
             let backup = tab.commit_message_backup.take();
             match result {
-                Ok(message) => {
+                Ok((message, warnings)) => {
                     let (summary, description) = gitkraft_core::split_commit_message(&message);
                     tab.commit_message = summary;
                     tab.commit_description =
                         iced::widget::text_editor::Content::with_text(&description);
-                    tab.status_message = Some("Commit message generated.".into());
+                    tab.status_message = Some(if warnings.is_empty() {
+                        "Commit message generated.".into()
+                    } else {
+                        format!("Commit message generated, but: {}", warnings.join("; "))
+                    });
                     // Show the start of the summary, not wherever the cursor was.
                     iced::widget::operation::move_cursor_to_front(iced::widget::Id::new(
                         "commit_message_input",

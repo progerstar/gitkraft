@@ -54,9 +54,26 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The settings menu owns the keyboard while it is open.
+    if app.menu.is_open() {
+        features::menu::events::handle_key(app, key);
+        return;
+    }
+
+    if app.main_menu.is_some() {
+        features::mouse::menu_key(app, key);
+        return;
+    }
+    // The picker floats over the hub (the main screen shows it as a pane).
+    if app.show_editor_panel && app.screen == AppScreen::Hub {
+        features::editor::events::handle_key(app, key);
+        return;
+    }
+
     match app.screen {
         AppScreen::Welcome => features::repo::events::handle_key(app, key),
         AppScreen::DirBrowser => handle_browser_key(app, key),
+        AppScreen::Hub => features::hub::events::handle_key(app, key),
         AppScreen::Main => {
             if app.show_about_panel {
                 features::about::events::handle_key(app, key);
@@ -93,6 +110,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             // -- Global keys (available in Normal mode on the Main screen) --
             match key.code {
                 KeyCode::Char('q') => app.should_quit = true,
+                KeyCode::Char('H') => features::hub::events::open(app),
+                KeyCode::Char('M') => app.open_menu(),
+                KeyCode::Char('A' | '?') => app.show_actions_panel = !app.show_actions_panel,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.should_quit = true;
                 }
@@ -119,7 +139,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.cycle_theme_next();
                     app.save_theme();
                 }
-                KeyCode::Char('A') => {
+                KeyCode::Char('I') => {
                     app.show_about_panel = !app.show_about_panel;
                     app.show_theme_panel = false;
                     app.show_options_panel = false;
@@ -136,9 +156,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.show_editor_panel = false;
                 }
                 KeyCode::Char('E') => {
-                    app.show_editor_panel = !app.show_editor_panel;
-                    app.show_theme_panel = false;
-                    app.show_options_panel = false;
+                    if app.show_editor_panel {
+                        app.show_editor_panel = false;
+                    } else {
+                        app.open_editor_picker();
+                    }
                 }
                 KeyCode::Char('o') => {
                     let start = app
@@ -470,6 +492,21 @@ mod tests {
         app.screen = AppScreen::Main;
         handle_key(&mut app, key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn question_mark_shows_and_hides_the_actions_pane_and_shift_i_the_info() {
+        let mut app = App::new();
+        app.screen = AppScreen::Main;
+        assert!(!app.show_actions_panel, "hidden by default");
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        assert!(app.show_actions_panel);
+        handle_key(&mut app, key(KeyCode::Char('A')));
+        assert!(!app.show_actions_panel, "Shift+A toggles it too");
+        handle_key(&mut app, key(KeyCode::Char('I')));
+        assert!(app.show_about_panel);
+        handle_key(&mut app, key(KeyCode::Char('I')));
+        assert!(!app.show_about_panel);
     }
 
     #[test]

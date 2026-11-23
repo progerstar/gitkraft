@@ -1,0 +1,32 @@
+[package]
+name = "gitkraft-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The glue every GitKraft front-end shares: accounts, dashboard sections to data, pulse, contributions"
+categories = ["development-tools"]
+keywords = ["git", "dashboard", "pull-requests", "ci"]
+
+[dependencies]
+gitkraft-platforms = { workspace = true }
+gitkraft-ci        = { workspace = true }
+gitkraft-settings  = { workspace = true }
+gitkraft-core      = { workspace = true }
+git2               = { workspace = true }
+dirs               = { workspace = true }
+chrono   = { workspace = true }
+futures  = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }
+anyhow   = { workspace = true }
+toml     = { workspace = true }
+tokio    = { workspace = true }   # a runtime of its own for commit_ai::generate_blocking
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

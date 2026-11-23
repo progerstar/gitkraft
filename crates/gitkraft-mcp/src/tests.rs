@@ -1,0 +1,894 @@
+//! The tools against a fake platform: no network.
+
+use gitkraft_hub::Hub;
+use gitkraft_platforms::testing::FakeClient;
+use gitkraft_platforms::{Account, DynClient, PlatformKind, RepoId, Secret};
+use rmcp::handler::server::wrapper::Parameters;
+use serde_json::Value;
+
+use crate::Policy;
+use crate::read::*;
+use crate::server::GitkraftServer;
+use crate::write::*;
+
+const BASE: &str = "https://api.github.com/repos/o/r";
+
+fn rig(policy: Policy) -> (GitkraftServer, FakeClient) {
+    let fake = FakeClient::new();
+    let mut account = Account::new(PlatformKind::GitHub, "github.com").with_token(Secret::new("t"));
+    account.me = Some("me".into());
+    let hub = Hub::new(vec![account], &DynClient::new(fake.clone()));
+    let repo = Some(RepoId::new("github.com", "o", "r"));
+    (GitkraftServer::new(hub, repo, policy), fake)
+}
+
+fn write() -> Policy {
+    Policy {
+        write: true,
+        allow_force: false,
+    }
+}
+
+fn json(s: &str) -> Value {
+    serde_json::from_str(s).unwrap_or_else(|e| panic!("{e}: {s}"))
+}
+
+fn sent(fake: &FakeClient) -> Vec<(String, String)> {
+    fake.requests()
+        .into_iter()
+        .map(|r| {
+            (
+                r.url,
+                String::from_utf8_lossy(r.body.as_deref().unwrap_or_default()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn read_only_servers_have_no_write_tools_and_write_servers_have_all() {
+    let (ro, _) = rig(Policy::default());
+    let names = ro.tool_names();
+    for t in [
+        "accounts",
+        "my_pull_requests",
+        "get_pull_request",
+        "ci_runs",
+        "remotes",
+        "ci_runs_all_remotes",
+        "ci_job_log",
+        "pulse",
+        "agent_jobs",
+        "agent_report",
+        "discussions",
+        "wiki",
+        "boards",
+    ] {
+        assert!(names.iter().any(|n| n == t), "{t} in {names:?}");
+    }
+    for t in [
+        "comment",
+        "review",
+        "merge_pull_request",
+        "set_open",
+        "edit_labels",
+        "ci_rerun",
+        "ci_cancel",
+        "dispatch_workflow",
+        "update_branch",
+        "comment_discussion",
+        "reply_discussion",
+        "mark_answer",
+        "save_wiki_page",
+        "move_card",
+        "push_all_remotes",
+        "new_card",
+        "reorder_card",
+        "agent_run",
+        "agent_set_enabled",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == t),
+            "{t} must not exist read-only"
+        );
+    }
+    let (rw, _) = rig(write());
+    let names = rw.tool_names();
+    for t in [
+        "comment",
+        "review",
+        "merge_pull_request",
+        "update_branch",
+        "cancel_auto_merge",
+        "set_open",
+        "edit_labels",
+        "ci_rerun",
+        "ci_cancel",
+        "dispatch_workflow",
+        "comment_discussion",
+        "reply_discussion",
+        "mark_answer",
+        "save_wiki_page",
+        "move_card",
+        "push_all_remotes",
+        "new_card",
+        "reorder_card",
+    ] {
+        assert!(names.iter().any(|n| n == t), "{t} in {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn repo_resolution_uses_the_default_a_short_form_or_refuses() {
+    let (s, _) = rig(Policy::default());
+    assert_eq!(
+        s.repo(None).map(|r| r.key()).ok().as_deref(),
+        Some("github.com/o/r")
+    );
+    assert_eq!(
+        s.repo(Some("x/y")).map(|r| r.key()).ok().as_deref(),
+        Some("github.com/x/y")
+    );
+    assert_eq!(
+        s.repo(Some("codeberg.org/a/b"))
+            .map(|r| r.key())
+            .ok()
+            .as_deref(),
+        Some("codeberg.org/a/b")
+    );
+    assert!(s.repo(Some("nonsense")).is_err());
+    let (hubless, _) = rig(Policy::default());
+    let none = GitkraftServer::new(
+        Hub::new(vec![], &DynClient::new(FakeClient::new())),
+        None,
+        Policy::default(),
+    );
+    assert!(none.repo(None).is_err());
+    assert!(
+        none.repo(Some("x/y")).is_err(),
+        "no account to take the host from"
+    );
+    drop(hubless);
+}
+
+#[tokio::test]
+async fn accounts_reports_the_policy_and_the_login() {
+    let (s, _) = rig(write());
+    let v = json(&s.accounts().await.expect("tool"));
+    assert_eq!(v["accounts"][0]["host"], "github.com");
+    assert_eq!(v["accounts"][0]["me"], "me");
+    assert_eq!(v["write"], true);
+    assert_eq!(v["allow_force"], false);
+    assert_eq!(v["default_repo"], "github.com/o/r");
+}
+
+fn pr_json() -> &'static str {
+    r#"{"number":7,"title":"Add pulse","body":"long text","state":"open","user":{"login":"alice","avatar_url":"a"},"head":{"ref":"feat","sha":"abc"},"base":{"ref":"master"},"additions":3,"deletions":1,"html_url":"u"}"#
+}
+
+#[tokio::test]
+async fn lists_are_slim_and_details_carry_the_text() {
+    let (s, fake) = rig(Policy::default());
+    fake.push_json(&format!("{BASE}/pulls"), &format!("[{}]", pr_json()));
+    let list = s
+        .list_pull_requests(Parameters(ListArgs::default()))
+        .await
+        .expect("tool");
+    let v = json(&list);
+    assert_eq!(v["items"][0]["title"], "Add pulse");
+    assert!(
+        v["items"][0].get("body").is_none(),
+        "lists drop descriptions: {list}"
+    );
+    assert!(!list.contains("avatar_url"));
+
+    fake.push_json(&format!("{BASE}/pulls/7"), pr_json());
+    fake.push_json(
+        &format!("{BASE}/commits/abc/status"),
+        r#"{"state":"success"}"#,
+    );
+    fake.push_json(
+        &format!("{BASE}/issues/7/comments"),
+        r#"[{"id":1,"body":"nice","user":{"login":"bob"}}]"#,
+    );
+    fake.push_json(
+        &format!("{BASE}/pulls/7/reviews"),
+        r#"[{"state":"APPROVED","user":{"login":"carol"}}]"#,
+    );
+    fake.push_status(
+        &format!("{BASE}/pulls/7.diff"),
+        200,
+        "diff --git a/x b/x\n+new line",
+    );
+    let item = |diff| ItemArgs {
+        repo: None,
+        number: 7,
+        include_diff: diff,
+        max_diff_chars: Some(12),
+    };
+    let one = json(
+        &s.get_pull_request(Parameters(item(None)))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(one["pull_request"]["body"], "long text");
+    assert_eq!(one["comments"][0]["body"], "nice");
+    assert!(one["diff"].is_null() && one["diff_chars"].as_u64() > Some(10));
+}
+
+#[tokio::test]
+async fn a_diff_is_included_on_request_and_cut() {
+    let (s, fake) = rig(Policy::default());
+    fake.push_json(&format!("{BASE}/pulls/7"), pr_json());
+    fake.push_json(
+        &format!("{BASE}/commits/abc/status"),
+        r#"{"state":"success"}"#,
+    );
+    fake.push_json(&format!("{BASE}/issues/7/comments"), "[]");
+    fake.push_json(&format!("{BASE}/pulls/7/reviews"), "[]");
+    fake.push_status(
+        &format!("{BASE}/pulls/7.diff"),
+        200,
+        "diff --git a/x b/x\n+new line",
+    );
+    let v = json(
+        &s.get_pull_request(Parameters(ItemArgs {
+            repo: None,
+            number: 7,
+            include_diff: Some(true),
+            max_diff_chars: Some(12),
+        }))
+        .await
+        .expect("tool"),
+    );
+    assert_eq!(v["diff"], "diff --git a");
+    assert_eq!(v["diff_truncated"], true);
+}
+
+#[tokio::test]
+async fn bad_filters_are_invalid_params_before_any_call() {
+    let (s, fake) = rig(Policy::default());
+    let e = s
+        .list_pull_requests(Parameters(ListArgs {
+            state: Some("sideways".into()),
+            ..ListArgs::default()
+        }))
+        .await
+        .expect_err("refused");
+    assert!(e.message.contains("state must be"), "{}", e.message);
+    let e = s
+        .ci_runs(Parameters(RunsArgs {
+            status: Some("wat".into()),
+            ..RunsArgs::default()
+        }))
+        .await
+        .expect_err("refused");
+    assert!(e.message.contains("status must be"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_platform_failure_names_the_tool_and_the_reason() {
+    let (s, fake) = rig(Policy::default());
+    fake.push_status(&format!("{BASE}/pulls"), 404, "nope");
+    let e = s
+        .list_pull_requests(Parameters(ListArgs::default()))
+        .await
+        .expect_err("fails");
+    assert!(
+        e.message.starts_with("list_pull_requests:"),
+        "{}",
+        e.message
+    );
+}
+
+#[tokio::test]
+async fn the_job_log_is_clean_tailed_or_grepped() {
+    let (s, fake) = rig(Policy::default());
+    let log = "start\n\u{1b}[31merror: boom\u{1b}[0m\nmid\nend";
+    fake.push_status(&format!("{BASE}/actions/jobs/11/logs"), 200, log);
+    fake.push_status(&format!("{BASE}/actions/jobs/11/logs"), 200, log);
+    let args = |tail, grep: Option<&str>| LogArgs {
+        repo: None,
+        job_id: 11,
+        tail_lines: tail,
+        grep: grep.map(Into::into),
+    };
+    let tail = json(
+        &s.ci_job_log(Parameters(args(Some(2), None)))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(tail["total_lines"], 4);
+    assert_eq!(tail["lines"], serde_json::json!(["mid", "end"]));
+    let grep = json(
+        &s.ci_job_log(Parameters(args(None, Some("ERROR"))))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(grep["lines"], serde_json::json!(["2: error: boom"]));
+}
+
+#[tokio::test]
+async fn writes_reach_the_platform_with_what_was_asked() {
+    let (s, fake) = rig(write());
+    fake.push_json(&format!("{BASE}/issues/7/comments"), "{}");
+    s.comment(Parameters(CommentArgs {
+        repo: None,
+        kind: "pr".into(),
+        number: 7,
+        body: "ship it".into(),
+    }))
+    .await
+    .expect("comment");
+    fake.push_json(&format!("{BASE}/pulls/7/merge"), r#"{"merged":true}"#);
+    let m = s
+        .merge_pull_request(Parameters(MergeArgs {
+            repo: None,
+            number: 7,
+            method: Some("squash".into()),
+            when: None,
+            force: None,
+        }))
+        .await
+        .expect("merge");
+    assert!(
+        json(&m)["message"]
+            .as_str()
+            .is_some_and(|t| t.contains("merged")),
+        "{m}"
+    );
+    let sent = sent(&fake);
+    assert!(sent[0].1.contains("ship it"));
+    assert!(sent[1].1.contains("squash"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn a_force_merge_is_refused_without_allow_force_and_nothing_is_sent() {
+    let (s, fake) = rig(write());
+    let e = s
+        .merge_pull_request(Parameters(MergeArgs {
+            repo: None,
+            number: 7,
+            method: None,
+            when: None,
+            force: Some(true),
+        }))
+        .await
+        .expect_err("refused");
+    assert!(e.message.contains("--allow-force"), "{}", e.message);
+    assert!(fake.requests().is_empty());
+
+    let forced = GitkraftServer::new(
+        Hub::new(vec![], &DynClient::new(FakeClient::new())),
+        None,
+        Policy {
+            write: true,
+            allow_force: true,
+        },
+    );
+    // allowed by policy: it then fails on the missing account, not on the policy
+    let e = forced
+        .merge_pull_request(Parameters(MergeArgs {
+            repo: Some("github.com/o/r".into()),
+            number: 7,
+            method: None,
+            when: None,
+            force: Some(true),
+        }))
+        .await
+        .expect_err("no account");
+    assert!(e.message.contains("no account"), "{}", e.message);
+}
+
+#[tokio::test]
+async fn write_arguments_are_validated_first() {
+    let (s, fake) = rig(write());
+    let bad =
+        |e: rmcp::ErrorData, needle: &str| assert!(e.message.contains(needle), "{}", e.message);
+    bad(
+        s.comment(Parameters(CommentArgs {
+            repo: None,
+            kind: "pr".into(),
+            number: 1,
+            body: "  ".into(),
+        }))
+        .await
+        .expect_err("empty"),
+        "empty",
+    );
+    bad(
+        s.review(Parameters(ReviewArgs {
+            repo: None,
+            number: 1,
+            verdict: "request_changes".into(),
+            body: None,
+        }))
+        .await
+        .expect_err("needs body"),
+        "needs a body",
+    );
+    bad(
+        s.merge_pull_request(Parameters(MergeArgs {
+            repo: None,
+            number: 1,
+            method: Some("ff".into()),
+            when: None,
+            force: None,
+        }))
+        .await
+        .expect_err("method"),
+        "method must be",
+    );
+    bad(
+        s.edit_labels(Parameters(LabelsArgs {
+            repo: None,
+            kind: "pr".into(),
+            number: 1,
+            add: vec![],
+            remove: vec![],
+        }))
+        .await
+        .expect_err("nothing"),
+        "labels",
+    );
+    bad(
+        s.ci_rerun(Parameters(RerunArgs {
+            repo: None,
+            run_id: 1,
+            scope: Some("some".into()),
+        }))
+        .await
+        .expect_err("scope"),
+        "scope must be",
+    );
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn activity_day_groups_the_day_and_refuses_days_outside_the_calendar() {
+    let (s, fake) = rig(Policy::default());
+    let today = chrono::Utc::now().date_naive();
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"user":{"contributionsCollection":{"contributionCalendar":{"totalContributions":2},"commitContributionsByRepository":[{"repository":{"nameWithOwner":"o/r","url":"u"},"contributions":{"totalCount":2}}],"pullRequestContributions":{"nodes":[]},"issueContributions":{"nodes":[]},"pullRequestReviewContributions":{"nodes":[]}}}}}"#,
+    );
+    let v = json(
+        &s.activity_day(Parameters(DayArgs { date: None }))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(v["headline"], format!("2 contributions on {today}"));
+    assert_eq!(v["groups"][0]["items"][0]["repo"], "github.com/o/r");
+    let before = fake.requests().len();
+    for bad in ["soon", "2999-01-01", "2001-01-01"] {
+        assert!(
+            s.activity_day(Parameters(DayArgs {
+                date: Some(bad.into())
+            }))
+            .await
+            .is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(fake.requests().len(), before);
+}
+
+#[tokio::test]
+async fn discussions_list_slim_and_read_with_comments_and_wiki_says_why_not() {
+    let (s, fake) = rig(Policy::default());
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"repository":{"hasDiscussionsEnabled":true,"discussions":{"nodes":[{"id":"D","number":5,"title":"Q","url":"u","body":"long text","updatedAt":"2026-05-01T10:00:00Z","isAnswered":false,"category":{"name":"Q&A"},"author":{"login":"a","avatarUrl":"x"},"commentCount":{"totalCount":2}}]}}}}"#,
+    );
+    let v = json(
+        &s.discussions(Parameters(DiscussionsArgs::default()))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(v["discussions"][0]["title"], "Q");
+    assert!(v["discussions"][0].get("body").is_none(), "lists are slim");
+    let err = s
+        .wiki(Parameters(WikiArgs::default()))
+        .await
+        .expect_err("github has no wiki api");
+    assert!(err.message.contains(".wiki.git"), "{err:?}");
+}
+
+#[tokio::test]
+async fn boards_come_back_as_columns_of_cards() {
+    let (s, fake) = rig(Policy::default());
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"repository":{"projectsV2":{"nodes":[{"title":"Roadmap","field":{"options":[{"name":"Todo"}]},"items":{"nodes":[{"fieldValueByName":{"name":"Todo"},"content":{"number":4,"title":"Add it","url":"u","assignees":{"nodes":[]}}}]}}]}}}}"#,
+    );
+    let v = json(
+        &s.boards(Parameters(RepoArgs::default()))
+            .await
+            .expect("tool"),
+    );
+    assert_eq!(v["boards"][0]["name"], "Roadmap");
+    assert_eq!(v["boards"][0]["columns"][0]["cards"][0]["number"], 4);
+}
+
+#[tokio::test]
+async fn a_push_goes_to_every_forge_remote_and_reports_each() {
+    use gitkraft_hub::wiki_git::ScriptedGit;
+    let (s, _) = two_forges();
+    let write_server = GitkraftServer::new(
+        Hub::new(vec![], &DynClient::new(FakeClient::new())),
+        None,
+        write(),
+    )
+    .with_project(
+        std::env::temp_dir(),
+        gitkraft_hub::project::Project::from_remotes(&[
+            ("origin".to_string(), "git@github.com:me/p.git".to_string()),
+            (
+                "codeberg".to_string(),
+                "ssh://git@codeberg.org/me/p.git".to_string(),
+            ),
+        ]),
+    )
+    .with_git(std::sync::Arc::new(ScriptedGit {
+        head: "main".into(),
+        refuse: vec!["origin".into()],
+        ..ScriptedGit::default()
+    }));
+    let res = write_server.push_all_remotes().await.expect("pushed");
+    let v = json(&res);
+    assert_eq!(v["branch"], "main");
+    assert_eq!(v["ok"], false, "origin refused");
+    assert_eq!(v["remotes"][1]["ok"], true, "codeberg still got it");
+    // a read-only server has no such tool
+    assert!(!s.tool_names().iter().any(|n| n == "push_all_remotes"));
+}
+
+#[tokio::test]
+async fn cards_are_added_and_ordered_through_the_platform() {
+    let boards = r#"{"data":{"repository":{"projectsV2":{"nodes":[{"id":"P","title":"Dev",
+        "field":{"id":"F","options":[{"id":"O1","name":"Todo"}]},
+        "items":{"nodes":[
+        {"id":"I1","fieldValueByName":{"name":"Todo"},"content":{"number":1,"title":"a","url":"u","assignees":{"nodes":[]}}},
+        {"id":"I2","fieldValueByName":{"name":"Todo"},"content":{"number":2,"title":"b","url":"u","assignees":{"nodes":[]}}}]}}]}}}}"#;
+    let (s, fake) = rig(write());
+    fake.push_json("https://api.github.com/graphql", boards);
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"updateProjectV2ItemPosition":{"items":{"nodes":[]}}}}"#,
+    );
+    let ok = s
+        .reorder_card(Parameters(ReorderCardArgs {
+            repo: None,
+            number: 2,
+            way: "up".into(),
+            board: None,
+        }))
+        .await
+        .expect("reorder");
+    assert!(
+        json(&ok)["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("up")
+    );
+    let bad = s
+        .reorder_card(Parameters(ReorderCardArgs {
+            repo: None,
+            number: 2,
+            way: "sideways".into(),
+            board: None,
+        }))
+        .await;
+    assert!(bad.is_err());
+    let empty = s
+        .new_card(Parameters(NewCardArgs {
+            repo: None,
+            title: " ".into(),
+            column: None,
+            board: None,
+        }))
+        .await;
+    assert!(
+        empty.is_err(),
+        "an untitled card never reaches the platform"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_is_marked_through_the_platform() {
+    let (s, fake) = rig(write());
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"repository":{"discussion":{"comments":{"nodes":[{"databaseId":9,"id":"C_9"}]}}}}}"#,
+    );
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"markDiscussionCommentAsAnswer":{"discussion":{"id":"D"}}}}"#,
+    );
+    let ok = s
+        .mark_answer(Parameters(DiscussionAnswerArgs {
+            repo: None,
+            number: 5,
+            comment_id: 9,
+        }))
+        .await
+        .expect("marked");
+    assert!(
+        json(&ok)["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("answer")
+    );
+    assert!(
+        sent(&fake)
+            .last()
+            .is_some_and(|(_, b)| b.contains("markDiscussionCommentAsAnswer"))
+    );
+}
+
+#[tokio::test]
+async fn a_discussion_reply_a_card_move_and_a_wiki_save_reach_the_platform_or_say_why_not() {
+    let (s, fake) = rig(write());
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"repository":{"discussion":{"id":"D_1","comments":{"nodes":[{"databaseId":9,"id":"C_9","replies":{"nodes":[]}}]}}}}}"#,
+    );
+    fake.push_json(
+        "https://api.github.com/graphql",
+        r#"{"data":{"addDiscussionComment":{"comment":{"id":"C_new"}}}}"#,
+    );
+    let ok = s
+        .reply_discussion(Parameters(DiscussionReplyArgs {
+            repo: None,
+            number: 5,
+            comment_id: 9,
+            body: "thanks".into(),
+        }))
+        .await
+        .expect("reply");
+    assert!(
+        json(&ok)["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("comment 9")
+    );
+    assert!(
+        sent(&fake)
+            .last()
+            .is_some_and(|(_, b)| b.contains("replyToId"))
+    );
+
+    let empty = s
+        .reply_discussion(Parameters(DiscussionReplyArgs {
+            repo: None,
+            number: 5,
+            comment_id: 9,
+            body: " ".into(),
+        }))
+        .await;
+    assert!(empty.is_err(), "an empty reply never reaches the platform");
+
+    // GitHub has no wiki API: the refusal says why.
+    let wiki = s
+        .save_wiki_page(Parameters(WikiSaveArgs {
+            repo: None,
+            slug: None,
+            title: "Home".into(),
+            content: "# Hi".into(),
+            message: None,
+        }))
+        .await
+        .expect_err("github wiki");
+    assert!(format!("{wiki:?}").contains("git"), "{wiki:?}");
+
+    let missing = s
+        .move_card(Parameters(MoveCardArgs {
+            repo: None,
+            number: 1,
+            column: "Done".into(),
+            board: None,
+        }))
+        .await;
+    assert!(missing.is_err());
+}
+
+fn two_forges() -> (GitkraftServer, FakeClient) {
+    let fake = FakeClient::new();
+    let mut gh = Account::new(PlatformKind::GitHub, "github.com").with_token(Secret::new("t"));
+    gh.me = Some("me".into());
+    let mut cb = Account::new(PlatformKind::Gitea, "codeberg.org").with_token(Secret::new("t"));
+    cb.me = Some("me".into());
+    let hub = Hub::new(vec![gh, cb], &DynClient::new(fake.clone()));
+    let project = gitkraft_hub::project::Project::from_remotes(&[
+        ("origin".to_string(), "git@github.com:me/p.git".to_string()),
+        (
+            "codeberg".to_string(),
+            "ssh://git@codeberg.org/me/p.git".to_string(),
+        ),
+        ("lan".to_string(), "gitea@gitea.lan:me/p.git".to_string()),
+    ]);
+    let s = GitkraftServer::new(hub, project.primary().cloned(), Policy::default())
+        .with_project(std::env::temp_dir(), project);
+    (s, fake)
+}
+
+#[tokio::test]
+async fn the_remotes_tool_lists_every_forge_and_a_remote_name_picks_one() {
+    let (s, fake) = two_forges();
+    let v = json(&s.remotes().await.expect("remotes"));
+    let names: Vec<&str> = v["remotes"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|r| r["remote"].as_str())
+        .collect();
+    assert_eq!(names, ["origin", "codeberg", "lan"]);
+    assert_eq!(v["remotes"][2]["account"], false);
+    let body = r#"{"workflow_runs":[]}"#;
+    fake.push_json("https://codeberg.org/api/v1/repos/me/p/actions/runs", body);
+    s.ci_runs(Parameters(RunsArgs {
+        repo: Some("codeberg".into()),
+        ..RunsArgs::default()
+    }))
+    .await
+    .expect("runs");
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| r.url.contains("codeberg.org"))
+    );
+}
+
+#[tokio::test]
+async fn runs_of_all_remotes_come_folded_with_the_forges_that_could_not_be_asked() {
+    let (s, fake) = two_forges();
+    let run = |id: u32, c: &str| {
+        format!(
+            r#"{{"workflow_runs":[{{"id":{id},"name":"CI","status":"completed","conclusion":"{c}","head_branch":"main","head_sha":"abc","run_number":1,"event":"push","created_at":"2026-05-01T10:00:00Z","html_url":"u","actor":{{"login":"a"}}}}]}}"#
+        )
+    };
+    fake.push_json(
+        "https://api.github.com/repos/me/p/actions/runs",
+        &run(1, "success"),
+    );
+    fake.push_json(
+        "https://codeberg.org/api/v1/repos/me/p/actions/runs",
+        &run(2, "failure"),
+    );
+    let v = json(
+        &s.ci_runs_all_remotes(Parameters(RunsArgs::default()))
+            .await
+            .expect("runs"),
+    );
+    assert_eq!(v["groups"].as_array().map(Vec::len), Some(1));
+    assert_eq!(v["groups"][0]["status"], "Failed");
+    assert_eq!(v["groups"][0]["agree"], false);
+    assert!(
+        v["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gitea.lan"),
+        "{v}"
+    );
+}
+
+fn agents_rig(policy: Policy) -> (GitkraftServer, tempfile::TempDir, FakeClient) {
+    let (s, fake) = rig(policy);
+    let dir = tempfile::tempdir().expect("tmp");
+    let s = s.with_agent_dirs(dir.path().join("cfg"), dir.path().join("reports"));
+    (s, dir, fake)
+}
+
+fn seeded(dir: &tempfile::TempDir) {
+    use gitkraft_hub::agent_watch::{AgentAction, AgentsState, Store};
+    let mut st = AgentsState::in_dirs(dir.path().join("cfg"), dir.path().join("reports"));
+    st.apply(&AgentAction::AddJob("oss".into())).expect("add");
+    let report: gitkraft_hub::agent_watch::Report = serde_json::from_value(serde_json::json!({
+        "job": "oss", "started": "2026-03-01T08:00:00Z", "finished": "2026-03-01T08:01:00Z",
+        "harness": "none", "repos": 3, "workflows": 5,
+        "findings": [{"repo": "github.com/o/r", "kind": "failed_run", "what": "ci", "url": "u"}],
+        "summary": "one red"
+    }))
+    .expect("report");
+    Store::new(dir.path().join("reports"))
+        .save(&report)
+        .expect("save");
+}
+
+#[tokio::test]
+async fn agent_tools_list_jobs_and_read_reports_and_say_when_nothing_is_set_up() {
+    let (s, _) = rig(Policy::default());
+    assert!(
+        s.agent_jobs().await.is_err(),
+        "no directories: a clear error"
+    );
+    let (s, dir, _) = agents_rig(Policy::default());
+    assert!(
+        json(&s.agent_jobs().await.expect("jobs"))["jobs"]
+            .as_array()
+            .expect("array")
+            .is_empty()
+    );
+    seeded(&dir);
+    let v = json(&s.agent_jobs().await.expect("jobs"));
+    assert_eq!(v["jobs"][0]["name"], "oss");
+    assert_eq!(v["jobs"][0]["unseen"], true);
+    let r = json(
+        &s.agent_report(Parameters(AgentReportArgs {
+            job: "oss".into(),
+            nth: None,
+        }))
+        .await
+        .expect("report"),
+    );
+    assert!(
+        r["markdown"]
+            .as_str()
+            .is_some_and(|m| m.contains("one red")),
+        "{r}"
+    );
+    assert!(
+        s.agent_report(Parameters(AgentReportArgs {
+            job: "oss".into(),
+            nth: Some(5)
+        }))
+        .await
+        .is_err()
+    );
+    assert!(
+        s.agent_report(Parameters(AgentReportArgs {
+            job: "nope".into(),
+            nth: None
+        }))
+        .await
+        .is_err()
+    );
+    // reading through the tool does not mark it seen
+    assert_eq!(
+        json(&s.agent_jobs().await.expect("jobs"))["jobs"][0]["unseen"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn agent_write_tools_pause_a_job_and_run_one() {
+    let (s, dir, _) = agents_rig(write());
+    seeded(&dir);
+    s.agent_set_enabled(Parameters(AgentJobArgs {
+        job: "oss".into(),
+        on: Some(false),
+    }))
+    .await
+    .expect("pause");
+    assert_eq!(
+        json(&s.agent_jobs().await.expect("jobs"))["jobs"][0]["enabled"],
+        false
+    );
+    assert!(
+        s.agent_set_enabled(Parameters(AgentJobArgs {
+            job: "oss".into(),
+            on: None
+        }))
+        .await
+        .is_err()
+    );
+    // nothing scripted behind the fake: the run still ends and files a report
+    let v = json(
+        &s.agent_run(Parameters(AgentJobArgs {
+            job: "oss".into(),
+            on: None,
+        }))
+        .await
+        .expect("run"),
+    );
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(
+        s.agent_run(Parameters(AgentJobArgs {
+            job: "nope".into(),
+            on: None
+        }))
+        .await
+        .is_err()
+    );
+}

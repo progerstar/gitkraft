@@ -57,7 +57,7 @@ pub(crate) fn welcome_view<'a>(state: &'a GitKraft) -> Element<'a, Message> {
     .style(theme::toolbar_button)
     .on_press(Message::OpenRepo);
 
-    let init_icon = icon!(icons::PERSON_FILL, 16);
+    let init_icon = icon!(icons::FOLDER_PLUS, 16);
 
     let init_btn = button(
         iced::widget::row![init_icon, text(" Init Repository").size(16)]
@@ -68,7 +68,25 @@ pub(crate) fn welcome_view<'a>(state: &'a GitKraft) -> Element<'a, Message> {
     .style(theme::toolbar_button)
     .on_press(Message::InitRepo);
 
-    let hint = text("Open an existing repository or initialise a new one to get started.")
+    let clone_input =
+        iced::widget::text_input("owner/name, host/owner/name or a URL", &state.clone_spec)
+            .on_input(Message::CloneSpecChanged)
+            .on_submit(Message::CloneRepo)
+            .padding(8)
+            .size(14);
+    let clone_btn = button(
+        iced::widget::row![icon!(icons::CLOUD_ARROW_DOWN, 16), text(" Clone").size(16)]
+            .spacing(6)
+            .align_y(Alignment::Center),
+    )
+    .padding([8, 16])
+    .style(theme::toolbar_button)
+    .on_press(Message::CloneRepo);
+    let clone_row = row![clone_input, clone_btn]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+    let hint = text("Open, clone or initialise a repository to get started.")
         .size(14)
         .color(c.muted);
 
@@ -81,13 +99,16 @@ pub(crate) fn welcome_view<'a>(state: &'a GitKraft) -> Element<'a, Message> {
         iced::widget::rule::horizontal(1),
         Space::new().height(8),
         init_btn,
+        Space::new().height(8),
+        clone_row,
         Space::new().height(16),
         hint,
     ]
     .spacing(4)
     .align_x(Alignment::Center)
-    .width(Length::Fill)
-    .max_width(420);
+    // Fixed, so the card shrinks around it and the screen centres the card (a Fill column
+    // stretched the card to the whole width with the content at its left edge).
+    .width(Length::Fixed(420.0));
 
     // ── Recent repositories ───────────────────────────────────────────────
     if !state.recent_repos.is_empty() {

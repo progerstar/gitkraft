@@ -1,0 +1,36 @@
+[package]
+name = "gitkraft-platforms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub, GitLab and Gitea/Forgejo/Codeberg behind one model: PRs, issues, reviews, notifications, contributions"
+categories = ["development-tools", "api-bindings"]
+keywords = ["git", "github", "gitlab", "gitea", "forge"]
+
+[dependencies]
+gitkraft-settings = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+thiserror   = { workspace = true }
+reqwest     = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+sha2        = { workspace = true }
+base64      = { workspace = true }
+notify-rust = { workspace = true, optional = true }
+
+[features]
+default = []
+# Desktop notifications (macOS, Linux, Windows) through notify-rust.
+desktop = ["dep:notify-rust"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

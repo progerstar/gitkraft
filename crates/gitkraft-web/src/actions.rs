@@ -1,0 +1,1144 @@
+//! Actions the pages send as JSON: comment, review, merge, close, CI re-run, notification switch.
+
+use gitkraft_ci::Run;
+use gitkraft_hub::args;
+use gitkraft_platforms::model::{MergeOptions, ReviewVerdict};
+use gitkraft_platforms::{ItemKind, RepoId};
+use gitkraft_settings::files;
+use gitkraft_settings::notify::set_enabled;
+use serde::Deserialize;
+
+use crate::session::Session;
+
+/// Pull request or issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// A pull / merge request.
+    Pr,
+    /// An issue.
+    Issue,
+}
+
+/// One action of the page.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ActionRequest {
+    /// Clone `spec` (`owner/name`, `host/owner/name` or a URL) into a new folder inside `into`
+    /// (default: beside the first repository); the page then opens it.
+    Clone {
+        /// What to clone.
+        spec: String,
+        /// Parent folder.
+        #[serde(default)]
+        into: Option<String>,
+    },
+    /// Post a comment.
+    Comment {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// PR or issue.
+        kind: Kind,
+        /// Text.
+        body: String,
+    },
+    /// Comment on one line of a pull request's diff.
+    LineComment {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// Index of the line in the diff as the page shows it.
+        line: usize,
+        /// The comment.
+        body: String,
+    },
+    /// Comment on a GitHub discussion.
+    DiscussionComment {
+        /// `host/owner/name`.
+        repo: String,
+        /// Discussion number.
+        number: u64,
+        /// Text.
+        body: String,
+    },
+    /// Answer a comment of a GitHub discussion.
+    /// Mark a comment as the answer of its discussion.
+    DiscussionAnswer {
+        /// `host/owner/name`.
+        repo: String,
+        /// Discussion number.
+        number: u64,
+        /// The comment's id.
+        comment_id: u64,
+    },
+    DiscussionReply {
+        /// `host/owner/name`.
+        repo: String,
+        /// Discussion number.
+        number: u64,
+        /// Id of the comment answered.
+        comment_id: u64,
+        /// Text.
+        body: String,
+    },
+    /// Create (no `slug`) or edit a wiki page.
+    WikiSave {
+        /// `host/owner/name`.
+        repo: String,
+        /// The page to edit.
+        #[serde(default)]
+        slug: Option<String>,
+        /// Title.
+        title: String,
+        /// The whole Markdown content.
+        content: String,
+        /// Change message.
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Add a card to a board.
+    NewCard {
+        /// `host/owner/name`.
+        repo: String,
+        /// Title of the card.
+        title: String,
+        /// Column to put it in.
+        #[serde(default)]
+        column: Option<String>,
+        /// The board when the repository has several.
+        #[serde(default)]
+        board: Option<String>,
+    },
+    /// Move a card inside its column.
+    ShiftCard {
+        /// `host/owner/name`.
+        repo: String,
+        /// The card's issue or PR number.
+        number: u64,
+        /// `up`, `down` or `top`.
+        way: String,
+        /// The board when the card is on several.
+        #[serde(default)]
+        board: Option<String>,
+    },
+    /// Move a board card to another column.
+    MoveCard {
+        /// `host/owner/name`.
+        repo: String,
+        /// The card's issue or PR number.
+        number: u64,
+        /// Target column (name, start or part of it).
+        column: String,
+        /// The board when the card is on several.
+        #[serde(default)]
+        board: Option<String>,
+    },
+    /// Merge a PR.
+    Merge {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// `merge`, `squash` or `rebase`.
+        #[serde(default)]
+        method: Option<String>,
+        /// `now` (default), `when_green` or `queue`.
+        #[serde(default)]
+        when: Option<String>,
+        /// Merge past branch rules (admin), or jump the queue.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Bring a PR's branch up to date with its target.
+    UpdateBranch {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// `merge`, `rebase`, or absent for the platform's own way.
+        #[serde(default)]
+        style: Option<String>,
+    },
+    /// Cancel a scheduled auto-merge or leave the merge queue.
+    CancelAutoMerge {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+    },
+    /// Review a PR.
+    Review {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// `approve`, `request_changes` or `comment`.
+        verdict: String,
+        /// Note.
+        #[serde(default)]
+        body: String,
+    },
+    /// Close or reopen.
+    SetOpen {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// PR or issue.
+        kind: Kind,
+        /// The state it should have.
+        open: bool,
+    },
+    /// Change a local repository (stage, commit, branch, stash, fetch, push …).
+    Git {
+        /// Index of the repository in the Repository page's list.
+        r: usize,
+        /// What to do.
+        #[serde(flatten)]
+        op: crate::local::GitOp,
+    },
+    /// Add and remove labels, typed as `+bug -wontfix "good first issue"`.
+    Labels {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+        /// PR or issue.
+        kind: Kind,
+        /// The edit.
+        text: String,
+    },
+    /// Re-run CI.
+    Rerun {
+        /// `host/owner/name`.
+        repo: String,
+        /// Run id.
+        run_id: u64,
+        /// Branch of the run (GitLab needs it to start a fresh pipeline).
+        #[serde(default)]
+        branch: String,
+        /// `all` or `failed`.
+        scope: String,
+    },
+    /// Cancel a CI run.
+    Cancel {
+        /// `host/owner/name`.
+        repo: String,
+        /// Run id.
+        run_id: u64,
+    },
+    /// Ask the AI why a CI job failed (a draft: it changes nothing).
+    Explain {
+        /// `host/owner/name`.
+        repo: String,
+        /// Run id.
+        run_id: u64,
+        /// The job to explain; absent or not failed: the first failed one.
+        #[serde(default)]
+        job_id: Option<u64>,
+    },
+    /// An AI draft about a pull request (changes nothing): `summary`, `catch_up` or `review`.
+    PrAi {
+        /// `host/owner/name`.
+        repo: String,
+        /// Pull request number.
+        number: u64,
+        /// `summary`, `catch_up` or `review`.
+        what: String,
+        /// `YYYY-MM-DD`, for `catch_up`.
+        #[serde(default)]
+        since: Option<String>,
+    },
+    /// AI triage of the inbox (changes nothing).
+    Triage,
+    /// Start a workflow by hand.
+    Dispatch {
+        /// `host/owner/name`.
+        repo: String,
+        /// Workflow file such as `ci.yml`; empty where there are none (GitLab).
+        #[serde(default)]
+        workflow: String,
+        /// Branch or tag.
+        git_ref: String,
+        /// `key=value` pairs separated by spaces or new lines.
+        #[serde(default)]
+        inputs: String,
+    },
+    /// Fetch a pull request into a worktree next to the local checkout.
+    Worktree {
+        /// `host/owner/name`.
+        repo: String,
+        /// Number.
+        number: u64,
+    },
+    /// Create or reuse this machine's key for a host, register it and configure ssh.
+    SshSetup {
+        /// Host name, e.g. `github.com`.
+        host: String,
+    },
+    /// Remove a key from an account.
+    SshRevoke {
+        /// Host name.
+        host: String,
+        /// Platform id of the key.
+        id: String,
+    },
+    /// Run `ssh -T git@host`.
+    SshTest {
+        /// Host name.
+        host: String,
+    },
+    /// A change on the Agents page.
+    Agent {
+        /// What to do.
+        op: gitkraft_hub::agent_watch::AgentAction,
+    },
+    /// Create an agent job.
+    AgentAdd {
+        /// Its name.
+        name: String,
+    },
+    /// Set the model of the selected agent job.
+    AgentModel {
+        /// Model name, empty for the harness default.
+        #[serde(default)]
+        model: String,
+    },
+    /// Set the instructions of the selected agent job.
+    AgentPrompt {
+        /// Text, empty for the built-in instructions.
+        #[serde(default)]
+        prompt: String,
+    },
+    /// Set the globs of the selected agent job.
+    AgentGlobs {
+        /// Words on `host/owner/name`, `!` excludes.
+        #[serde(default)]
+        globs: String,
+    },
+    /// Run an agent job now (it goes on in the background).
+    AgentRun {
+        /// Job name.
+        job: String,
+    },
+    /// Read the jobs and the repository list again.
+    AgentReload,
+    /// Switch the colour theme (index into the theme list).
+    SetTheme {
+        /// Index into `THEME_NAMES`.
+        index: usize,
+    },
+    /// Turn notifications on or off for a project (`repo` empty: everything).
+    NotifyToggle {
+        /// `host/owner/name`, or empty for the global switch.
+        #[serde(default)]
+        repo: String,
+        /// New state.
+        on: bool,
+    },
+}
+
+fn repo_of(key: &str) -> Result<RepoId, String> {
+    RepoId::from_key(key).ok_or_else(|| format!("'{key}' is not host/owner/name"))
+}
+
+/// Runs `req`; returns a short confirmation or the reason it failed.
+pub async fn perform(session: &Session, req: ActionRequest) -> Result<String, String> {
+    perform_to(session, req).await.map(|(message, _)| message)
+}
+
+/// Runs an action: what to tell the user, and the page to go to next (else the page reloads).
+///
+/// # Errors
+/// What went wrong, for the page to show.
+pub async fn perform_to(
+    session: &Session,
+    req: ActionRequest,
+) -> Result<(String, Option<String>), String> {
+    if let ActionRequest::Clone { spec, into } = req {
+        if session.is_demo() {
+            return Err("the demo is read-only".into());
+        }
+        let parent = into
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| session.clone_parent(), std::path::PathBuf::from);
+        let dest = tokio::task::spawn_blocking(move || clone_into(&spec, &parent))
+            .await
+            .map_err(|e| e.to_string())??;
+        let shown = dest.display().to_string();
+        let r = session.add_repo(dest.canonicalize().unwrap_or(dest));
+        return Ok((format!("cloned into {shown}"), Some(format!("/git?r={r}"))));
+    }
+    perform_inner(session, req).await.map(|m| (m, None))
+}
+
+/// Plans (as `gitkraft-tui clone` and the GUI do) and runs a clone; the new checkout.
+fn clone_into(spec: &str, parent: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !parent.is_dir() {
+        return Err(format!("{} is not a folder", parent.display()));
+    }
+    let accounts = if cfg!(test) {
+        gitkraft_hub::accounts::AccountsFile::default()
+    } else {
+        gitkraft_hub::accounts::AccountsFile::saved_or_default()
+    };
+    let plan = gitkraft_hub::clone::plan(spec, None, None, &accounts, parent)?;
+    if plan.dest.exists() {
+        return Err(format!("{} exists already", plan.dest.display()));
+    }
+    gitkraft_core::features::remotes::transport::clone_repo(&plan.url, &plan.dest)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(plan.dest)
+}
+
+async fn perform_inner(session: &Session, req: ActionRequest) -> Result<String, String> {
+    let hub = session.hub();
+    if let ActionRequest::Git { r, op } = req {
+        if session.is_demo() {
+            return Err("the demo is read-only".into());
+        }
+        let path = session
+            .repos()
+            .get(r)
+            .cloned()
+            .ok_or("that repository is not known to this server")?;
+        return tokio::task::spawn_blocking(move || crate::local::run(&path, &op))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let result = match req {
+        ActionRequest::Comment {
+            repo,
+            number,
+            kind,
+            body,
+        } => {
+            if body.trim().is_empty() {
+                return Err("a comment needs some text".into());
+            }
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let kind = if kind == Kind::Pr {
+                ItemKind::PullRequest
+            } else {
+                ItemKind::Issue
+            };
+            backend
+                .post_comment(&repo, kind, number, body.trim())
+                .await
+                .map(|()| "comment posted".to_string())
+        }
+        ActionRequest::LineComment {
+            repo,
+            number,
+            line,
+            body,
+        } => {
+            if body.trim().is_empty() {
+                return Err("a comment needs some text".into());
+            }
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            // Map the index on the current diff, so the page cannot point at a made-up line.
+            let diff = backend
+                .pull_request_diff(&repo, number)
+                .await
+                .map_err(|e| e.to_string())?;
+            let anchor = gitkraft_platforms::diffpos::positions(&diff)
+                .get(line)
+                .and_then(gitkraft_platforms::diffpos::DiffPos::anchor)
+                .ok_or("that line cannot take a comment (a header, or the diff changed)")?;
+            backend
+                .comment_on_line(&repo, number, &anchor, body.trim())
+                .await
+                .map(|()| format!("commented on {}:{}", anchor.path, anchor.line))
+        }
+        ActionRequest::DiscussionComment { repo, number, body } => {
+            if body.trim().is_empty() {
+                return Err("a comment needs some text".into());
+            }
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            backend
+                .comment_on_discussion(&repo, number, body.trim())
+                .await
+                .map(|()| "comment posted".to_string())
+        }
+        ActionRequest::DiscussionAnswer {
+            repo,
+            number,
+            comment_id,
+        } => {
+            let repo = repo_of(&repo)?;
+            let out = gitkraft_hub::community::mark_answer(hub, &repo, number, comment_id).await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::DiscussionReply {
+            repo,
+            number,
+            comment_id,
+            body,
+        } => {
+            let repo = repo_of(&repo)?;
+            let out = gitkraft_hub::community::reply(hub, &repo, number, comment_id, &body).await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::WikiSave {
+            repo,
+            slug,
+            title,
+            content,
+            message,
+        } => {
+            let repo = repo_of(&repo)?;
+            let out = gitkraft_hub::community::save_wiki(
+                hub,
+                &repo,
+                slug.as_deref(),
+                &title,
+                &content,
+                message.as_deref().unwrap_or_default(),
+            )
+            .await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::NewCard {
+            repo,
+            title,
+            column,
+            board,
+        } => {
+            let repo = repo_of(&repo)?;
+            let out = gitkraft_hub::community::new_card(
+                hub,
+                &repo,
+                board.as_deref(),
+                &title,
+                column.as_deref(),
+            )
+            .await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::ShiftCard {
+            repo,
+            number,
+            way,
+            board,
+        } => {
+            let repo = repo_of(&repo)?;
+            let shift = gitkraft_hub::community::Shift::parse(&way)?;
+            let out =
+                gitkraft_hub::community::reorder_card(hub, &repo, board.as_deref(), number, shift)
+                    .await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::MoveCard {
+            repo,
+            number,
+            column,
+            board,
+        } => {
+            let repo = repo_of(&repo)?;
+            let out =
+                gitkraft_hub::community::move_card(hub, &repo, board.as_deref(), number, &column)
+                    .await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::Merge {
+            repo,
+            number,
+            method,
+            when,
+            force,
+        } => {
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let method = args::merge_method(method.as_deref())?;
+            let timing = args::merge_timing(when.as_deref())?;
+            let options = MergeOptions {
+                method,
+                timing,
+                force,
+            };
+            backend
+                .merge_with(&repo, number, &options)
+                .await
+                .map(|o| o.describe(number))
+        }
+        ActionRequest::UpdateBranch {
+            repo,
+            number,
+            style,
+        } => {
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let style = args::update_style(style.as_deref())?;
+            backend
+                .update_branch(&repo, number, style)
+                .await
+                .map(|()| format!("#{number} is being updated"))
+        }
+        ActionRequest::CancelAutoMerge { repo, number } => {
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            backend
+                .cancel_auto_merge(&repo, number)
+                .await
+                .map(|()| format!("#{number} will no longer auto-merge"))
+        }
+        ActionRequest::Review {
+            repo,
+            number,
+            verdict,
+            body,
+        } => {
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let verdict = args::verdict(&verdict)?;
+            if verdict == ReviewVerdict::RequestChanges && body.trim().is_empty() {
+                return Err("requesting changes needs a note".into());
+            }
+            backend
+                .submit_review(&repo, number, verdict, body.trim())
+                .await
+                .map(|()| "review sent".to_string())
+        }
+        ActionRequest::SetOpen {
+            repo,
+            number,
+            kind,
+            open,
+        } => {
+            let repo = repo_of(&repo)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let kind = if kind == Kind::Pr {
+                ItemKind::PullRequest
+            } else {
+                ItemKind::Issue
+            };
+            backend
+                .set_open(&repo, kind, number, open)
+                .await
+                .map(|()| format!("#{number} {}", if open { "reopened" } else { "closed" }))
+        }
+        ActionRequest::Labels {
+            repo,
+            number,
+            kind,
+            text,
+        } => {
+            let repo = repo_of(&repo)?;
+            let edit = gitkraft_hub::labels::parse(&text)?;
+            let backend = hub.backend(&repo.host).ok_or("no account for this host")?;
+            let kind = if kind == Kind::Pr {
+                ItemKind::PullRequest
+            } else {
+                ItemKind::Issue
+            };
+            backend
+                .edit_labels(&repo, kind, number, &edit.add, &edit.remove)
+                .await
+                .map(|()| format!("labels of #{number} changed"))
+        }
+        ActionRequest::Git { .. } | ActionRequest::Clone { .. } => {
+            return Err("unexpected action".into());
+        }
+        ActionRequest::Rerun {
+            repo,
+            run_id,
+            branch,
+            scope,
+        } => {
+            let repo = repo_of(&repo)?;
+            let ci = hub.ci(&repo.host).ok_or("no account for this host")?;
+            let scope = args::rerun_scope(&scope)?;
+            let run = Run {
+                id: run_id,
+                branch,
+                ..Run::default()
+            };
+            ci.rerun(&repo, &run, scope)
+                .await
+                .map(|()| "re-run started".to_string())
+        }
+        ActionRequest::Cancel { repo, run_id } => {
+            let repo = repo_of(&repo)?;
+            let ci = hub.ci(&repo.host).ok_or("no account for this host")?;
+            ci.cancel(&repo, run_id)
+                .await
+                .map(|()| "run cancelled".to_string())
+        }
+        ActionRequest::Explain {
+            repo,
+            run_id,
+            job_id,
+        } => {
+            let repo = repo_of(&repo)?;
+            let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            return explain_with(session, &llm, &repo, run_id, job_id).await;
+        }
+        ActionRequest::PrAi {
+            repo,
+            number,
+            what,
+            since,
+        } => {
+            let repo = repo_of(&repo)?;
+            let action = gitkraft_hub::review_ai::Action::parse(&what)
+                .ok_or("what must be summary, catch_up or review")?;
+            session.ai_policy()?.check(&repo.host, action)?;
+            let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            return pr_ai_with(session, &llm, &repo, number, action, since.as_deref()).await;
+        }
+        ActionRequest::Triage => {
+            let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            return triage_with(session, &llm).await;
+        }
+        ActionRequest::Dispatch {
+            repo,
+            workflow,
+            git_ref,
+            inputs,
+        } => {
+            let repo = repo_of(&repo)?;
+            let ci = hub.ci(&repo.host).ok_or("no account for this host")?;
+            if workflow.contains(char::is_whitespace) || git_ref.contains(char::is_whitespace) {
+                return Err("workflow and branch must not contain spaces".into());
+            }
+            let needs = !workflow.is_empty();
+            let text = format!("{workflow} {git_ref} {}", inputs.replace('\n', " "));
+            let d = gitkraft_hub::dispatch::parse(&text, needs)?;
+            let out = gitkraft_hub::dispatch::start(ci, &repo, &d).await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::Worktree { repo, number } => {
+            let repo = repo_of(&repo)?;
+            let kind = hub
+                .backend(&repo.host)
+                .ok_or("no account for this host")?
+                .kind();
+            let path = session.checkout_of(&repo).ok_or_else(|| {
+                format!(
+                    "no local checkout of {} is known: start gitkraft-web inside it, or pass --checkout DIR",
+                    repo.full_name()
+                )
+            })?;
+            return tokio::task::spawn_blocking(move || {
+                gitkraft_hub::checkout::checkout_worktree(kind, &repo, number, &path)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        ActionRequest::SshSetup { host } => {
+            let dir = session
+                .ssh_dir()
+                .ok_or("this session may not change the ssh directory")?
+                .to_path_buf();
+            let machine = gitkraft_hub::keys::machine_name();
+            let out = gitkraft_hub::keys::setup_host(
+                hub,
+                &host,
+                &dir,
+                &gitkraft_platforms::ssh::SystemSsh,
+                &machine,
+            )
+            .await;
+            session.invalidate();
+            return out.map(|t| t.lines().collect::<Vec<_>>().join(" · "));
+        }
+        ActionRequest::SshRevoke { host, id } => {
+            let out = gitkraft_hub::keys::revoke(hub, &host, &id).await;
+            session.invalidate();
+            return out;
+        }
+        ActionRequest::SshTest { host } => {
+            session.ssh_dir().ok_or("this session may not run ssh")?;
+            let (probe, line) = tokio::task::spawn_blocking(move || {
+                gitkraft_hub::keys::test_host(&gitkraft_platforms::ssh::SystemSsh, &host)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            return if matches!(probe, gitkraft_platforms::ssh::Probe::Authenticated { .. }) {
+                Ok(line)
+            } else {
+                Err(line)
+            };
+        }
+        ActionRequest::Agent { op } => {
+            return session.with_agents(|a| a.apply(&op));
+        }
+        ActionRequest::AgentAdd { name } => {
+            return session.with_agents(|a| a.add_job(&name));
+        }
+        ActionRequest::AgentModel { model } => {
+            return session.with_agents(|a| a.set_model(&model));
+        }
+        ActionRequest::AgentPrompt { prompt } => {
+            return session.with_agents(|a| a.set_prompt(&prompt));
+        }
+        ActionRequest::AgentGlobs { globs } => {
+            return session.with_agents(|a| a.set_globs(&globs));
+        }
+        ActionRequest::SetTheme { index } => {
+            return session.set_theme(index).map(|n| format!("theme: {n}"));
+        }
+        ActionRequest::AgentReload => {
+            session.with_agents(|a| a.reload());
+            session.agent_repos(true).await;
+            return Ok("reloaded".into());
+        }
+        ActionRequest::AgentRun { job } => {
+            let s = session.clone();
+            // fail fast on what can be known now; the run itself goes on after this answer
+            session.with_agents(|a| {
+                if let Some(r) = &a.running {
+                    return Err(format!("{r} is still running"));
+                }
+                a.cfg
+                    .job(&job)
+                    .map(|_| ())
+                    .ok_or_else(|| "no such job".to_string())
+            })?;
+            let name = job.clone();
+            tokio::spawn(async move {
+                let _ = s.run_agent(&name).await;
+            });
+            return Ok(format!("running {job}…"));
+        }
+        ActionRequest::NotifyToggle { repo, on } => {
+            return toggle_notifications(session, &repo, on);
+        }
+    };
+    session.invalidate();
+    result.map_err(|e| e.to_string())
+}
+
+/// Asks `llm` why a job of the run failed.
+pub(crate) async fn explain_with(
+    session: &Session,
+    llm: &impl gitkraft_hub::ai::Llm,
+    repo: &RepoId,
+    run_id: u64,
+    job_id: Option<u64>,
+) -> Result<String, String> {
+    let ci = session
+        .hub()
+        .ci(&repo.host)
+        .ok_or("no account for this host")?;
+    let detail = ci
+        .run_detail(repo, run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let job = gitkraft_hub::ai::failed_job(&detail.jobs, job_id)
+        .ok_or_else(|| format!("no failed job in run {run_id}"))?;
+    let ctx = gitkraft_hub::ai::failure_context(ci, &detail.run, job).await?;
+    let text = gitkraft_hub::ai::explain_failure(llm, &ctx)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("{} / {}\n\n{text}", ctx.workflow, ctx.job))
+}
+
+/// An AI draft about a pull request; refused unless the host allowed `action`.
+pub(crate) async fn pr_ai_with(
+    session: &Session,
+    llm: &impl gitkraft_hub::ai::Llm,
+    repo: &RepoId,
+    number: u64,
+    action: gitkraft_hub::review_ai::Action,
+    since: Option<&str>,
+) -> Result<String, String> {
+    use gitkraft_hub::review_ai::{self, Action};
+    session.ai_policy()?.check(&repo.host, action)?;
+    let since = since
+        .filter(|s| !s.is_empty())
+        .map(|d| {
+            d.parse::<chrono::NaiveDate>()
+                .map_err(|_| "since must be YYYY-MM-DD".to_string())
+                .map(|d| d.and_time(chrono::NaiveTime::MIN).and_utc())
+        })
+        .transpose()?;
+    let detail = session
+        .hub()
+        .pr_detail(repo, number)
+        .await
+        .map_err(|e| e.to_string())?;
+    match action {
+        Action::Summary => review_ai::summarize_pr(llm, &detail).await,
+        Action::CatchUp => review_ai::catch_up(llm, &detail, since).await,
+        Action::Review => review_ai::review_draft(llm, &detail)
+            .await
+            .map(|notes| notes.iter().map(|n| format!("{}\n", n.render())).collect()),
+        Action::Triage | Action::Watch => {
+            return Err("that action is not about a pull request".into());
+        }
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// AI triage of the inbox, for the hosts that allowed it.
+pub(crate) async fn triage_with(
+    session: &Session,
+    llm: &impl gitkraft_hub::ai::Llm,
+) -> Result<String, String> {
+    use gitkraft_hub::SectionData;
+    let SectionData::Inbox(r) = session
+        .hub()
+        .load_section(&gitkraft_hub::args::section(
+            "web",
+            gitkraft_settings::dashboard::SectionKind::Inbox,
+            None,
+            gitkraft_platforms::model::StateFilter::Open,
+        ))
+        .await
+    else {
+        return Err("unexpected section data".into());
+    };
+    let mut items = r.items;
+    items.truncate(30);
+    gitkraft_hub::review_ai::triage_report(llm, items, &session.ai_policy()?).await
+}
+
+fn toggle_notifications(session: &Session, repo: &str, on: bool) -> Result<String, String> {
+    let path = session
+        .notify_path()
+        .ok_or("this session has no notification config file")?;
+    let key = if repo.is_empty() {
+        None
+    } else {
+        Some(repo_of(repo)?.key())
+    };
+    let text = files::read_optional(path)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let edited = set_enabled(&text, key.as_deref(), on)?;
+    files::write_atomic(path, &edited).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "notifications {} for {}",
+        if on { "on" } else { "off" },
+        key.as_deref().unwrap_or("all projects")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use gitkraft_hub::Hub;
+    use gitkraft_hub::ai::FakeLlm;
+    use gitkraft_platforms::testing::FakeClient;
+    use gitkraft_platforms::{Account, DynClient, PlatformKind, Secret};
+    use gitkraft_settings::dashboard::Dashboard;
+
+    use super::*;
+    use crate::session::Paths;
+
+    fn session(fake: &FakeClient) -> Session {
+        let mut account =
+            Account::new(PlatformKind::GitHub, "github.com").with_token(Secret::new("t"));
+        account.me = Some("me".into());
+        let hub = Hub::new(vec![account], &DynClient::new(fake.clone()));
+        let paths = Paths {
+            dashboard: None,
+            notify: None,
+            use_state_dir: false,
+            ssh_dir: None,
+            checkouts: Vec::new(),
+            config_dir: None,
+            agents_store: None,
+        };
+        Session::new(hub, Dashboard { sections: vec![] }, paths, 0)
+    }
+
+    #[tokio::test]
+    async fn the_theme_can_be_switched_and_only_to_a_theme_that_exists() {
+        let s = session(&FakeClient::new());
+        assert_eq!(s.theme_index(), 0);
+        // `Dodai Sunset · Dark`, the last of the Dodai family proper.
+        let dodai = gitkraft_settings::theme::DODAI_FIRST + 9;
+        let msg = perform(&s, ActionRequest::SetTheme { index: dodai })
+            .await
+            .expect("a Dodai theme");
+        assert!(msg.starts_with("theme: Dodai"), "{msg}");
+        assert_eq!(s.theme_index(), dodai);
+        assert!(s.css_vars().contains(&format!("--gk-theme:{dodai}")));
+        let e = perform(&s, ActionRequest::SetTheme { index: 9999 })
+            .await
+            .expect_err("no such theme");
+        assert!(e.contains("no theme"));
+        assert_eq!(s.theme_index(), dodai, "a bad index changes nothing");
+    }
+
+    #[tokio::test]
+    async fn labels_are_edited_from_typed_text_and_bad_text_never_reaches_the_platform() {
+        let fake = FakeClient::new();
+        let s = session(&fake);
+        let edit = |text: &str| ActionRequest::Labels {
+            repo: "github.com/o/r".into(),
+            number: 3,
+            kind: Kind::Issue,
+            text: text.into(),
+        };
+        let e = perform(&s, edit("")).await.expect_err("empty");
+        assert!(e.contains("type labels"), "{e}");
+        assert!(fake.requests().is_empty(), "nothing was sent");
+        fake.push_json("https://api.github.com/repos/o/r/issues/3/labels", "[]");
+        let ok = perform(&s, edit("+bug")).await.expect("added");
+        assert!(ok.contains("#3"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn a_line_comment_lands_on_the_line_the_server_maps_from_the_current_diff() {
+        let fake = FakeClient::new();
+        let s = session(&fake);
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n one\n+two\n three\n";
+        let at = |line: usize, body: &str| ActionRequest::LineComment {
+            repo: "github.com/o/r".into(),
+            number: 3,
+            line,
+            body: body.into(),
+        };
+        let e = perform(&s, at(5, " ")).await.expect_err("empty");
+        assert!(e.contains("needs some text"), "{e}");
+        assert!(fake.requests().is_empty(), "nothing was sent");
+
+        // A header line cannot take a comment.
+        fake.push_json("https://api.github.com/repos/o/r/pulls/3.diff", diff);
+        let e = perform(&s, at(0, "nit")).await.expect_err("header");
+        assert!(e.contains("cannot take a comment"), "{e}");
+
+        // Line 5 is `+two`: line 2 of the new src/a.rs.
+        fake.push_json("https://api.github.com/repos/o/r/pulls/3.diff", diff);
+        fake.push_json(
+            "https://api.github.com/repos/o/r/pulls/3",
+            r#"{"number":3,"head":{"ref":"f","sha":"abc"},"base":{"ref":"main"}}"#,
+        );
+        fake.push_json("https://api.github.com/repos/o/r/pulls/3/comments", "{}");
+        let ok = perform(&s, at(5, "nit")).await.expect("posted");
+        assert_eq!(ok, "commented on src/a.rs:2");
+    }
+
+    const BASE: &str = "https://api.github.com/repos/o/r/actions";
+
+    #[tokio::test]
+    async fn a_pr_draft_goes_to_the_model_only_after_the_host_opted_in() {
+        use gitkraft_hub::review_ai::{Action, Policy};
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut p = Policy::default();
+        p.allow("github.com", &[Action::Summary]);
+        p.save(dir.path()).expect("save");
+        let fake = FakeClient::new();
+        let mut account =
+            Account::new(PlatformKind::GitHub, "github.com").with_token(Secret::new("t"));
+        account.me = Some("me".into());
+        let s = Session::new(
+            Hub::new(vec![account], &DynClient::new(fake.clone())),
+            Dashboard { sections: vec![] },
+            Paths {
+                config_dir: Some(dir.path().to_path_buf()),
+                ..Paths::default()
+            },
+            0,
+        );
+        let repo = RepoId::from_key("github.com/o/r").expect("repo");
+        let llm = FakeLlm::saying("What: x");
+        let off = pr_ai_with(&s, &llm, &repo, 7, Action::Review, None).await;
+        assert!(off.expect_err("off").contains("ai-allow github.com review"));
+        assert!(llm.prompts().is_empty());
+        fake.push_json(
+            "https://api.github.com/repos/o/r/pulls/7",
+            r#"{"number":7,"title":"T","state":"open","user":{"login":"a"},"head":{"ref":"f","sha":"s"},"base":{"ref":"m"},"html_url":"u"}"#,
+        );
+        fake.push_json(
+            "https://api.github.com/repos/o/r/commits/s/status",
+            r#"{"state":"success"}"#,
+        );
+        fake.push_json("https://api.github.com/repos/o/r/issues/7/comments", "[]");
+        fake.push_json("https://api.github.com/repos/o/r/pulls/7/reviews", "[]");
+        fake.push_status("https://api.github.com/repos/o/r/pulls/7.diff", 200, "diff");
+        let ok = pr_ai_with(&s, &llm, &repo, 7, Action::Summary, None).await;
+        assert_eq!(ok.expect("sent"), "What: x");
+        let bad = pr_ai_with(&s, &llm, &repo, 7, Action::Summary, Some("soon")).await;
+        assert!(bad.expect_err("date").contains("YYYY-MM-DD"));
+    }
+
+    fn failed_run(fake: &FakeClient) {
+        fake.push_json(
+            &format!("{BASE}/runs/5"),
+            r#"{"id":5,"name":"CI","run_number":9,"status":"completed","conclusion":"failure","head_branch":"main"}"#,
+        );
+        fake.push_json(
+            &format!("{BASE}/runs/5/jobs"),
+            r#"{"jobs":[{"id":10,"name":"lint","status":"completed","conclusion":"success","steps":[]},{"id":11,"name":"build","status":"completed","conclusion":"failure","steps":[]}]}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_sends_the_redacted_log_of_the_failed_job_and_returns_the_answer() {
+        let fake = FakeClient::new();
+        failed_run(&fake);
+        fake.push_status(
+            &format!("{BASE}/jobs/11/logs"),
+            200,
+            "error[E0425]: no x\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
+        );
+        let llm = FakeLlm::saying("Cause: typo");
+        let repo = RepoId::from_key("github.com/o/r").expect("repo");
+        let out = explain_with(&session(&fake), &llm, &repo, 5, None)
+            .await
+            .expect("answer");
+        assert!(out.starts_with("CI / build"), "{out}");
+        assert!(out.contains("Cause: typo"));
+        let prompts = llm.prompts();
+        assert!(prompts[0].1.contains("E0425"));
+        assert!(
+            !prompts[0].1.contains("ghp_abcdefghijkl"),
+            "secret reached the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_names_the_requested_job_only_when_it_failed_and_refuses_a_run_without_failures()
+     {
+        let fake = FakeClient::new();
+        failed_run(&fake);
+        fake.push_status(&format!("{BASE}/jobs/11/logs"), 200, "boom");
+        let repo = RepoId::from_key("github.com/o/r").expect("repo");
+        // Job 10 passed: the failed one is explained instead.
+        let out = explain_with(&session(&fake), &FakeLlm::saying("x"), &repo, 5, Some(10))
+            .await
+            .expect("answer");
+        assert!(out.contains("CI / build"));
+
+        let fake = FakeClient::new();
+        fake.push_json(
+            &format!("{BASE}/runs/5"),
+            r#"{"id":5,"name":"CI","status":"completed","conclusion":"success"}"#,
+        );
+        fake.push_json(
+            &format!("{BASE}/runs/5/jobs"),
+            r#"{"jobs":[{"id":10,"name":"lint","status":"completed","conclusion":"success","steps":[]}]}"#,
+        );
+        let err = explain_with(&session(&fake), &FakeLlm::saying("x"), &repo, 5, None)
+            .await
+            .expect_err("nothing to explain");
+        assert!(err.contains("no failed job"), "{err}");
+    }
+}

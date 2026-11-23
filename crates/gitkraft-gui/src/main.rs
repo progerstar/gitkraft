@@ -1,6 +1,15 @@
 use gitkraft_gui::GitKraft;
 use iced::Settings;
 
+/// Set once in `main`: the window starts hidden, in the tray.
+static BACKGROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The clicks on the tray menu.
+fn tray_stream() -> impl futures::Stream<Item = gitkraft_gui::Message> {
+    use futures::StreamExt;
+    gitkraft_gui::tray::commands().map(gitkraft_gui::Message::Tray)
+}
+
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
 
@@ -24,6 +33,19 @@ fn main() -> iced::Result {
         }
         _ => iced::window::Position::Default,
     };
+
+    // Started at login: begin in the tray, with no window, when there is a tray to come back from.
+    let background =
+        std::env::args().any(|a| a == gitkraft_core::features::autostart::BACKGROUND_ARG);
+    let tray_icon = gitkraft_core::features::persistence::ops::load_settings()
+        .map(|s| s.tray_icon)
+        .unwrap_or(true);
+    let start_hidden = background && tray_icon;
+    BACKGROUND.store(start_hidden, std::sync::atomic::Ordering::Relaxed);
+    let mut window_settings = gitkraft_gui::window::settings(window_size, window_position);
+    window_settings.visible = !start_hidden;
+    // Closing is handled by the app: it hides to the tray or quits.
+    window_settings.exit_on_close_request = false;
 
     iced::application(boot, GitKraft::update, GitKraft::view)
         .title("GitKraft — Git IDE")
@@ -88,7 +110,8 @@ fn main() -> iced::Result {
                 .iter()
                 .any(|t| t.is_loading || t.generating_commit_message);
             let animation_ticker = if any_loading {
-                iced::Subscription::run(animation_tick_stream)
+                iced::time::every(std::time::Duration::from_millis(100))
+                    .map(|_| gitkraft_gui::Message::AnimationTick)
             } else {
                 iced::Subscription::none()
             };
@@ -99,16 +122,37 @@ fn main() -> iced::Result {
                 iced::Subscription::none()
             };
             let system_theme = if state.follow_system {
-                iced::Subscription::run(system_theme_stream)
+                iced::time::every(std::time::Duration::from_secs(3))
+                    .map(|_| gitkraft_gui::Message::SystemThemeTick)
+            } else {
+                iced::Subscription::none()
+            };
+            // The hub polls for notifications and refreshes its bell every few seconds.
+            let hub_ticker = if state.hub.is_some() {
+                iced::time::every(std::time::Duration::from_secs(5)).map(|_| {
+                    gitkraft_gui::Message::Hub(gitkraft_gui::features::hub::HubMessage::Tick)
+                })
+            } else {
+                iced::Subscription::none()
+            };
+            let tray = if state.tray_icon {
+                iced::Subscription::batch([
+                    iced::Subscription::run(tray_stream),
+                    iced::time::every(std::time::Duration::from_secs(5))
+                        .map(|_| gitkraft_gui::Message::TrayRefresh),
+                ])
             } else {
                 iced::Subscription::none()
             };
             iced::Subscription::batch([
+                iced::window::close_requests().map(|_| gitkraft_gui::Message::CloseRequested),
+                tray,
                 keyboard,
                 git_watcher,
                 animation_ticker,
                 system_theme,
                 auto_fetch,
+                hub_ticker,
             ])
         })
         .scale_factor(|state: &GitKraft| state.ui_scale)
@@ -117,13 +161,25 @@ fn main() -> iced::Result {
             default_text_size: iced::Pixels(13.0),
             ..Default::default()
         })
-        .window(gitkraft_gui::window::settings(window_size, window_position))
+        .window(window_settings)
         .run()
 }
 
 /// Boot function — initializes application state and returns startup tasks.
 fn boot() -> (GitKraft, iced::Task<gitkraft_gui::Message>) {
     let (mut state, open_tabs) = GitKraft::new_with_session_paths();
+    let background = BACKGROUND.load(std::sync::atomic::Ordering::Relaxed);
+    state.background = background;
+    // The first look at the tray, and (when started at login) the hub behind the hidden window,
+    // so the daily agent schedule runs without anybody opening anything.
+    let tray_task = iced::Task::batch([
+        iced::Task::done(gitkraft_gui::Message::TrayRefresh),
+        if background {
+            iced::Task::done(gitkraft_gui::Message::BackgroundStart)
+        } else {
+            iced::Task::none()
+        },
+    ]);
 
     let maximize_task: iced::Task<gitkraft_gui::Message> =
         iced::window::oldest().and_then(|id| iced::window::maximize(id, true));
@@ -152,7 +208,12 @@ fn boot() -> (GitKraft, iced::Task<gitkraft_gui::Message>) {
 
     (
         state,
-        iced::Task::batch([maximize_task, gitkraft_gui::window::setup(), restore_task]),
+        iced::Task::batch([
+            maximize_task,
+            gitkraft_gui::window::setup(),
+            restore_task,
+            tray_task,
+        ]),
     )
 }
 
@@ -191,8 +252,9 @@ fn git_watch_builder(
 
 /// Stream that emits `FileSystemChanged` whenever the repository changes.
 ///
-/// Uses `spawn_git_watcher` from core (debounced, fallback poll); its thread
-/// hands each change over through an async channel.
+/// Uses `spawn_git_watcher` from core (debounced, fallback poll). The watcher thread feeds an
+/// async channel, so waiting for it never holds a runtime worker (a blocking `recv()` did, for
+/// as long as a repository was open).
 fn git_watch_stream(
     repo_path: std::path::PathBuf,
 ) -> impl futures::Stream<Item = gitkraft_gui::Message> {
@@ -201,60 +263,26 @@ fn git_watch_stream(
     let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
     let git_dir = repo_path.join(".git");
 
-    // The watcher thread exits once the subscription ends and drops `rx`.
+    // The thread exits when the send fails (the stream was dropped).
     gitkraft_core::spawn_git_watcher(git_dir, move || tx.unbounded_send(()).is_ok());
 
-    rx.map(|()| gitkraft_gui::Message::FileSystemChanged)
-}
-
-/// Yields after `first`, then every `period`, waiting on a thread of its own.
-///
-/// A subscription stream must never block: iced polls every subscription and
-/// every task on one small pool (a worker per CPU), so a blocking stream holds
-/// a worker for good. With all of them held, task results (fetch, push,
-/// refresh…) stop reaching the UI. The thread ends after the stream is dropped.
-fn ticker(
-    first: std::time::Duration,
-    period: std::time::Duration,
-) -> impl futures::Stream<Item = ()> {
-    let (mut tx, rx) = futures::channel::mpsc::channel(1);
-    std::thread::spawn(move || {
-        std::thread::sleep(first);
-        // A tick the UI has not taken yet makes this one a no-op.
-        while !tx.try_send(()).is_err_and(|e| e.is_disconnected()) {
-            std::thread::sleep(period);
-        }
-    });
-    rx
-}
-
-/// Emits `AnimationTick` at ~10 fps. Only subscribed while loading is in progress.
-fn animation_tick_stream() -> impl futures::Stream<Item = gitkraft_gui::Message> {
-    use futures::StreamExt;
-
-    let frame = std::time::Duration::from_millis(100);
-    ticker(frame, frame).map(|()| gitkraft_gui::Message::AnimationTick)
+    futures::stream::unfold(rx, |mut rx| async move {
+        // Wait for a change; ends when the watcher thread is gone.
+        rx.next()
+            .await
+            .map(|()| (gitkraft_gui::Message::FileSystemChanged, rx))
+    })
 }
 
 /// Emits [`gitkraft_gui::Message::AutoFetchTick`] 10 s after it starts, then
-/// every 5 minutes.
+/// every 5 minutes. Waits on a tokio timer (created inside the runtime, when
+/// the stream is first polled), so it never holds a runtime worker.
 fn auto_fetch_stream() -> impl futures::Stream<Item = gitkraft_gui::Message> {
-    use futures::StreamExt;
-
-    ticker(
-        std::time::Duration::from_secs(10),
-        std::time::Duration::from_secs(300),
-    )
-    .map(|()| gitkraft_gui::Message::AutoFetchTick)
-}
-
-/// Emits [`gitkraft_gui::Message::SystemThemeTick`] every 3 s (only subscribed
-/// while the theme follows the system).
-fn system_theme_stream() -> impl futures::Stream<Item = gitkraft_gui::Message> {
-    use futures::StreamExt;
-
-    let period = std::time::Duration::from_secs(3);
-    ticker(period, period).map(|()| gitkraft_gui::Message::SystemThemeTick)
+    futures::stream::unfold(true, |first| async move {
+        let wait = if first { 10 } else { 300 };
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        Some((gitkraft_gui::Message::AutoFetchTick, false))
+    })
 }
 
 /// Map keyboard shortcuts to messages.
@@ -288,6 +316,10 @@ fn handle_key_press(
             }
             // Ctrl/Cmd + W — close current tab / repo
             Key::Character(ref c) if c.as_str() == "w" => Some(gitkraft_gui::Message::CloseRepo),
+            // Ctrl/Cmd + P — the hub's command palette (ignored outside the hub)
+            Key::Character(ref c) if c.as_str() == "p" => Some(gitkraft_gui::Message::Hub(
+                gitkraft_gui::features::hub::HubMessage::PaletteToggle,
+            )),
             // Ctrl/Cmd + R — refresh
             Key::Character(ref c) if c.as_str() == "r" => Some(gitkraft_gui::Message::RefreshRepo),
             _ => None,

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::sync::mpsc;
 
@@ -125,6 +126,8 @@ pub enum BackgroundResult {
         path: PathBuf,
         result: Result<String, String>,
     },
+    /// An AI commit message draft arrived: the full message and rule warnings.
+    CommitDraft(Result<(String, Vec<String>), String>),
     /// A commit-diff load completed.
     CommitDiffLoaded(Result<Vec<DiffInfo>, String>),
     /// A staging-only refresh completed (unstaged + staged diffs reloaded).
@@ -177,6 +180,8 @@ pub enum AppScreen {
     Welcome,
     DirBrowser,
     Main,
+    /// Pull requests, issues, CI and notifications across platforms.
+    Hub,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +255,7 @@ pub struct RepoTab {
     /// `selected_diff` is a staged or working-tree diff from the staging
     /// lists, not a commit's.
     pub diff_from_staging: bool,
-    pub diff_scroll: u16,
+    pub diff_scroll: usize,
     /// Which half of the diff split pane has keyboard focus.
     pub diff_sub_pane: DiffSubPane,
     /// Anchor index for diff file list range selection (set on plain navigation).
@@ -334,7 +339,7 @@ pub struct RepoTab {
     /// Blame lines for the current blame overlay.
     pub blame_lines: Vec<gitkraft_core::BlameLine>,
     /// Scroll offset for the blame overlay (rows from top).
-    pub blame_scroll: u16,
+    pub blame_scroll: usize,
 
     /// When `Some(path)`, show a delete-confirmation prompt for that path.
     pub confirm_delete_file: Option<String>,
@@ -460,6 +465,8 @@ pub struct App {
     pub active_pane: ActivePane,
     pub input_mode: InputMode,
     pub input_purpose: InputPurpose,
+    /// Body of an AI-drafted commit message; the input line holds the subject.
+    pub commit_body: String,
     pub tick_count: u64,
 
     /// Receiver for results from background tasks.
@@ -473,6 +480,22 @@ pub struct App {
     pub show_theme_panel: bool,
     /// Whether the options panel is visible.
     pub show_options_panel: bool,
+    /// Where the panes were drawn in the last frame (for the mouse).
+    pub rects: crate::features::mouse::PaneRects,
+    /// The open right-click menu of the main screen.
+    pub main_menu: Option<crate::features::mouse::MainMenu>,
+    /// Clickable parts of the header, from the last frame.
+    pub header_hits: Vec<(Rect, crate::features::mouse::HeaderHit)>,
+    /// The panel drawn over the right of the main screen (theme, options, info).
+    pub panel_rect: Rect,
+    /// The last left click: when and where, for double-clicks.
+    pub last_click: Option<(std::time::Instant, u16, u16)>,
+    /// Whether the key-hint "Actions" pane shows in the staging area (`?` toggles it).
+    pub show_actions_panel: bool,
+    /// The animated settings menu (`M`).
+    pub menu: crate::features::menu::Menu,
+    /// Menus open instantly instead of sliding.
+    pub reduced_motion: bool,
     /// Whether the About panel is visible.
     pub show_about_panel: bool,
     /// Configured editor for opening files.
@@ -481,6 +504,8 @@ pub struct App {
     pub show_editor_panel: bool,
     /// ListState for the editor picker list.
     pub editor_list_state: ListState,
+    /// The command typed on the picker's "Custom command" row (`nano -w`, `code --wait`, a path).
+    pub editor_custom: String,
     /// Index of the active preset (0..THEME_COUNT). While following the
     /// system this is the preset the OS appearance currently resolves to.
     pub current_theme_index: usize,
@@ -500,6 +525,11 @@ pub struct App {
     /// Screen to return to when the directory browser is dismissed.
     pub browser_return_screen: AppScreen,
 
+    /// The hub screen's state while it is open.
+    pub hub: Option<Box<crate::features::hub::state::HubState>>,
+    /// Screen to return to when the hub closes.
+    pub hub_return_screen: AppScreen,
+
     /// Open repository tabs.
     pub tabs: Vec<RepoTab>,
     /// Index of the currently active tab.
@@ -509,6 +539,8 @@ pub struct App {
     /// paths in the configured terminal editor, then resumes.
     /// Supports both single-file (`vec![path]`) and multi-file (`vec![a, b, c]`) opens.
     pub pending_editor_open: Option<Vec<std::path::PathBuf>>,
+    /// After the terminal editor exits, send the hub's wiki draft back.
+    pub upload_wiki_after_editor: bool,
 
     /// Timestamp of the last auto-refresh.
     pub last_auto_refresh: std::time::Instant,
@@ -532,7 +564,7 @@ impl App {
         let theme_index = match settings.theme_name.as_deref() {
             Some(n) if gitkraft_core::is_system_name(n) => palette::system_index(),
             Some(n) => palette::index_by_name(n),
-            None => 0,
+            None => palette::default_index(),
         };
 
         let recent_repos = settings.recent_repos;
@@ -545,6 +577,7 @@ impl App {
             active_pane: ActivePane::Branches,
             input_mode: InputMode::Normal,
             input_purpose: InputPurpose::None,
+            commit_body: String::new(),
             tick_count: 0,
 
             bg_rx,
@@ -554,25 +587,22 @@ impl App {
 
             show_theme_panel: false,
             show_options_panel: false,
+            show_actions_panel: false,
+            rects: Default::default(),
+            main_menu: None,
+            last_click: None,
+            header_hits: Vec::new(),
+            panel_rect: Rect::default(),
+            menu: crate::features::menu::Menu::default(),
+            reduced_motion: settings.reduced_motion,
             show_about_panel: false,
             editor: settings
                 .editor_name
                 .as_deref()
-                .map(|name| {
-                    gitkraft_core::EDITOR_NAMES
-                        .iter()
-                        .position(|n| n.eq_ignore_ascii_case(name))
-                        .map(gitkraft_core::Editor::from_index)
-                        .unwrap_or_else(|| {
-                            if name.eq_ignore_ascii_case("none") {
-                                gitkraft_core::Editor::None
-                            } else {
-                                gitkraft_core::Editor::Custom(name.to_string())
-                            }
-                        })
-                })
+                .map(gitkraft_core::Editor::from_name)
                 .unwrap_or(gitkraft_core::Editor::None),
             show_editor_panel: false,
+            editor_custom: String::new(),
             editor_list_state: {
                 let mut s = ListState::default();
                 s.select(Some(0));
@@ -592,10 +622,14 @@ impl App {
             browser: None,
             browser_return_screen: AppScreen::Welcome,
 
+            hub: None,
+            hub_return_screen: AppScreen::Welcome,
+
             tabs: vec![RepoTab::new()],
             active_tab_index: 0,
 
             pending_editor_open: None,
+            upload_wiki_after_editor: false,
 
             last_auto_refresh: std::time::Instant::now(),
             last_refresh_completed: std::time::Instant::now() - std::time::Duration::from_secs(100),
@@ -760,6 +794,23 @@ impl App {
         crate::features::theme::palette::theme_for_index(self.current_theme_index)
     }
 
+    /// Remote URLs of every open repository, for finding platform accounts.
+    pub fn hub_repo_remotes(&self) -> Vec<(std::path::PathBuf, Vec<String>)> {
+        self.tabs
+            .iter()
+            .filter_map(|t| t.repo_path.clone())
+            .filter_map(|path| {
+                let repo = git2::Repository::open(&path).ok()?;
+                let urls = gitkraft_core::features::remotes::list_remotes(&repo)
+                    .ok()?
+                    .into_iter()
+                    .filter_map(|r| r.url)
+                    .collect();
+                Some((path, urls))
+            })
+            .collect()
+    }
+
     /// The active `tui-nuances` theme (used by embedded `tui-nuances`-aware widgets).
     pub fn nuances_theme(&self) -> tui_nuances::Theme {
         crate::features::theme::palette::nuances_theme_for_index(self.current_theme_index)
@@ -771,6 +822,26 @@ impl App {
             return; // never touch the user's real settings from unit tests
         }
         let _ = gitkraft_core::features::persistence::save_theme_tui(self.current_theme_name());
+    }
+
+    /// Opens the settings menu (it slides in unless reduced motion is on).
+    pub fn open_menu(&mut self) {
+        self.menu
+            .open(std::time::Instant::now(), self.reduced_motion);
+    }
+
+    /// Closes the settings menu at `now`.
+    pub fn close_menu(&mut self, now: std::time::Instant) {
+        self.menu.close(now, self.reduced_motion);
+    }
+
+    /// Persist the reduced-motion choice.
+    pub fn save_reduced_motion(&self) {
+        if cfg!(test) {
+            return;
+        }
+        let v = self.reduced_motion;
+        let _ = gitkraft_core::features::persistence::update_tui_settings(|s| s.reduced_motion = v);
     }
 
     /// Persist the paths of all open tabs for session restore.
@@ -903,6 +974,28 @@ impl App {
                             self.tabs[tab_idx].error_message = Some(e);
                             self.tabs[tab_idx].status_message = None;
                         }
+                    }
+                }
+                BackgroundResult::CommitDraft(res) => {
+                    self.tab_mut().is_loading = false;
+                    match res {
+                        Ok((message, warnings)) => {
+                            let (subject, body) = gitkraft_core::split_commit_message(&message);
+                            self.input_buffer = subject;
+                            self.commit_body = body;
+                            self.input_mode = InputMode::Input;
+                            self.input_purpose = InputPurpose::CommitMessage;
+                            let mut note =
+                                String::from("AI draft: edit the subject, Enter commits");
+                            if !self.commit_body.is_empty() {
+                                note.push_str(" (the body is kept)");
+                            }
+                            if !warnings.is_empty() {
+                                note.push_str(&format!(" ! {}", warnings.join("; ")));
+                            }
+                            self.tab_mut().status_message = Some(note);
+                        }
+                        Err(e) => self.tab_mut().error_message = Some(format!("AI: {e}")),
                     }
                 }
                 BackgroundResult::RemoteOpDone { path, result } => {
@@ -1306,8 +1399,28 @@ impl App {
 
     // ── Commit ───────────────────────────────────────────────────────────
 
+    /// Asks for a commit message for what is staged, from the agent command or the AI API
+    /// (`commit_message_backend` in `settings.json`); the answer arrives as
+    /// [`BackgroundResult::CommitDraft`] and fills the commit input.
+    pub fn draft_commit_message(&mut self) {
+        let Some(repo_path) = self.tab().repo_path.clone() else {
+            return;
+        };
+        self.tab_mut().is_loading = true;
+        self.tab_mut().status_message = Some("Drafting a commit message…".into());
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let result = gitkraft_hub::commit_ai::generate_blocking(&repo_path);
+            let _ = tx.send(BackgroundResult::CommitDraft(result));
+        });
+    }
+
     pub fn create_commit(&mut self) {
-        let msg = self.input_buffer.trim().to_string();
+        let mut msg = self.input_buffer.trim().to_string();
+        if !msg.is_empty() && !self.commit_body.trim().is_empty() {
+            msg = format!("{msg}\n\n{}", self.commit_body.trim());
+        }
+        self.commit_body.clear();
         if msg.is_empty() {
             self.tab_mut().error_message = Some("Commit message cannot be empty".into());
             return;
@@ -1766,12 +1879,33 @@ impl App {
         );
     }
 
+    /// Opens the editor picker with the current editor selected, on any screen.
+    pub fn open_editor_picker(&mut self) {
+        let row = match &self.editor {
+            gitkraft_core::Editor::None => 0,
+            gitkraft_core::Editor::Custom(c) => {
+                self.editor_custom = c.clone();
+                gitkraft_core::EDITOR_NAMES.len() + 1
+            }
+            e => gitkraft_core::EDITOR_NAMES
+                .iter()
+                .position(|n| *n == e.display_name())
+                .map_or(0, |i| i + 1),
+        };
+        self.editor_list_state.select(Some(row));
+        self.show_editor_panel = true;
+        self.show_theme_panel = false;
+        self.show_options_panel = false;
+        self.show_about_panel = false;
+    }
+
     pub fn close_repo(&mut self) {
         self.tabs[self.active_tab_index] = RepoTab::new();
         self.input_buffer.clear();
         self.show_theme_panel = false;
         self.show_options_panel = false;
         self.show_about_panel = false;
+        self.show_actions_panel = false;
         self.screen = AppScreen::Welcome;
         // Reload recent repos
         if let Ok(settings) = gitkraft_core::features::persistence::load_tui_settings() {
@@ -1826,7 +1960,11 @@ impl App {
                 gitkraft_core::features::persistence::load_tui_settings().unwrap_or_default();
             let _ = gitkraft_core::features::persistence::save_tui_settings(&snap);
         }
+        self.open_path_in_editor(path, "settings");
+    }
 
+    /// Open `path` in the configured editor; `what` names it in the status bar.
+    pub fn open_path_in_editor(&mut self, path: std::path::PathBuf, what: &str) {
         let path_str = path.display().to_string();
 
         if self.editor.is_terminal_editor() {
@@ -1834,7 +1972,7 @@ impl App {
             // Signal the event loop in lib.rs to suspend the TUI, run the
             // editor synchronously, then resume.
             self.tab_mut().status_message =
-                Some(format!("Opening settings in {} — {path_str}", self.editor));
+                Some(format!("Opening {what} in {} — {path_str}", self.editor));
             self.pending_editor_open = Some(vec![path]);
         } else if !matches!(self.editor, gitkraft_core::Editor::None) {
             // GUI editor (VS Code, Zed, …): open in background.
@@ -1843,20 +1981,21 @@ impl App {
             match self.editor.open_file(&path) {
                 Ok(()) => {
                     self.tab_mut().status_message =
-                        Some(format!("Settings opened in {} — {path_str}", self.editor));
+                        Some(format!("{what} opened in {} — {path_str}", self.editor));
                 }
                 Err(e) => {
                     self.tab_mut().error_message =
-                        Some(format!("Could not open settings ({e}) — path: {path_str}"));
+                        Some(format!("Could not open {what} ({e}) — path: {path_str}"));
                 }
             }
         } else {
             // No editor configured — show the path so the user can open it
             // manually, and remind them how to configure an editor.
             self.tab_mut().status_message = Some(format!(
-                "Settings: {path_str}  \
-                 (no editor configured — press E to choose one, or set editor in GUI)"
+                "{what}: {path_str}  \
+                 (no editor yet: pick one)"
             ));
+            self.open_editor_picker();
         }
     }
 
@@ -2718,7 +2857,7 @@ mod tests {
     #[test]
     fn theme_returns_struct() {
         let mut app = App::new();
-        app.current_theme_index = 0;
+        app.current_theme_index = palette::index_by_name("default");
         let theme = app.theme();
         // Active border comes from the tui-nuances default theme.
         assert_eq!(
@@ -4805,6 +4944,53 @@ mod tests {
         assert_eq!(
             app.tab().selected_diff.as_ref().map(|d| d.display_path()),
             Some("c.rs")
+        );
+    }
+
+    #[test]
+    fn a_message_splits_into_subject_and_body() {
+        assert_eq!(
+            gitkraft_hub::commit_ai::split_message("fix: a\n\nwhy\nmore\n"),
+            ("fix: a".to_string(), "why\nmore".to_string())
+        );
+        assert_eq!(
+            gitkraft_hub::commit_ai::split_message(" only "),
+            ("only".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn an_ai_draft_fills_the_commit_input_and_keeps_the_body() {
+        let mut app = App::new();
+        app.bg_tx
+            .send(BackgroundResult::CommitDraft(Ok((
+                "feat: x\n\nbody".into(),
+                vec!["subject is long".into()],
+            ))))
+            .expect("send");
+        app.poll_background();
+        assert_eq!(app.input_buffer, "feat: x");
+        assert_eq!(app.commit_body, "body");
+        assert_eq!(app.input_mode, InputMode::Input);
+        assert_eq!(app.input_purpose, InputPurpose::CommitMessage);
+        let status = app.tab().status_message.clone().unwrap_or_default();
+        assert!(status.contains("body is kept") && status.contains("subject is long"));
+    }
+
+    #[test]
+    fn a_failed_draft_is_an_error_not_an_input() {
+        let mut app = App::new();
+        app.bg_tx
+            .send(BackgroundResult::CommitDraft(Err("no key".into())))
+            .expect("send");
+        app.poll_background();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(
+            app.tab()
+                .error_message
+                .clone()
+                .unwrap_or_default()
+                .contains("no key")
         );
     }
 }

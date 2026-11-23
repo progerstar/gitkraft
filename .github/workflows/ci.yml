@@ -35,6 +35,10 @@ jobs:
           version: "0.116.1"
       - name: Install system packages
         run: nu scripts/ci/apt.nu
+      # Prebuilt binary: compiling cargo-udeps costs minutes on every run.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-udeps
       - name: Quality gate
         run: nu scripts/ci/quality_gate.nu
 
@@ -98,14 +102,14 @@ jobs:
         run: nu scripts/ci/wayland_smoke.nu --build
 
   msrv:
-    name: MSRV (1.90)
+    name: MSRV (1.91)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # @master + toolchain, not @1.90: Dependabot would bump a version ref.
+      # @master + toolchain, not @1.91: Dependabot would bump a version ref.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.90"
+          toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
       - uses: hustcer/setup-nu@v3
         with:
@@ -113,4 +117,4 @@ jobs:
       - name: Install system packages
         run: nu scripts/ci/apt.nu
       - name: cargo check
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --exclude gitkraft-web --locked

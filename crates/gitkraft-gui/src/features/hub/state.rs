@@ -1,0 +1,4019 @@
+//! State and update logic of the hub screen in the desktop app.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::{NaiveDate, Utc};
+use gitkraft_ci::annotations::{Annotation, extract};
+use gitkraft_ci::log::{LogLine, first_failure, parse_log};
+use gitkraft_ci::{RerunScope, RunDetail};
+use gitkraft_hub::accounts::{AccountsFile, discover};
+use gitkraft_hub::poller::{Engine, run_cycle};
+use gitkraft_hub::pulse::Pulse;
+use gitkraft_hub::{Hub, PrDetail, SectionData, SectionResult};
+use gitkraft_platforms::model::{
+    ActivityDay, Comment, ItemState, MergeMethod, MergeOptions, MergeTiming, ReviewVerdict,
+    UpdateStyle,
+};
+use gitkraft_platforms::notify::{Notifier, desktop::DesktopNotifier};
+use gitkraft_platforms::{CachedClient, ItemKind, RepoId, ReqwestClient};
+use gitkraft_settings::dashboard::{Dashboard, reorder};
+use gitkraft_settings::files;
+use gitkraft_settings::notify::{
+    NotifyConfig, NotifySettings, NotifyStatus, StatusInput, set_enabled, status,
+};
+use iced::Task;
+
+/// The HTTP client every account shares.
+pub type Client = Arc<CachedClient<ReqwestClient>>;
+/// The hub over that client.
+pub type Api = Hub<Client>;
+
+/// A shared handle that can sit in a message.
+#[derive(Clone)]
+pub struct ApiHandle(pub Arc<Api>);
+
+impl std::fmt::Debug for ApiHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiHandle(..)")
+    }
+}
+
+/// Id of the palette text box.
+pub(crate) const PALETTE_INPUT: &str = "hub_palette";
+
+/// What setup found.
+#[derive(Debug, Clone)]
+pub struct Setup {
+    /// The hub.
+    pub api: ApiHandle,
+    /// Projects to watch for notifications.
+    pub watched: Vec<RepoId>,
+    /// Number of accounts.
+    pub accounts: usize,
+}
+
+/// Top-level views of the hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubView {
+    /// Sections with list and detail.
+    Dashboard,
+    /// Activity graphs.
+    Pulse,
+    /// SSH keys of every account.
+    Keys,
+    /// Discussions and the wiki of one repository.
+    Community,
+    /// Scheduled agents that watch the CI of the projects you pick.
+    Agents,
+}
+
+/// Tabs of the PR detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrTab {
+    /// Description and reviews.
+    Overview,
+    /// The diff.
+    Diff,
+    /// Comments.
+    Comments,
+}
+
+/// Messages of the hub.
+#[derive(Debug, Clone)]
+pub enum HubMessage {
+    /// Open the hub screen.
+    Open,
+    /// Leave it.
+    Close,
+    /// Setup finished.
+    Ready(Result<Setup, String>),
+    /// Switch view.
+    Show(HubView),
+    /// Pick a section (visible index).
+    SelectSection(usize),
+    /// Pick a row.
+    SelectRow(usize),
+    /// Reload the active section.
+    Refresh,
+    /// Show the next remote's items (all → each forge → all).
+    CycleScope,
+    /// A section was loaded.
+    SectionLoaded {
+        idx: usize,
+        generation: u64,
+        data: Arc<SectionData>,
+    },
+    /// A PR detail was loaded.
+    PrLoaded {
+        key: String,
+        result: Result<Arc<PrDetail>, String>,
+    },
+    /// Issue comments were loaded.
+    CommentsLoaded {
+        key: String,
+        result: Result<Vec<Comment>, String>,
+    },
+    /// A run detail was loaded.
+    RunLoaded {
+        key: String,
+        result: Result<Arc<RunDetail>, String>,
+    },
+    /// Pick a PR tab.
+    Tab(PrTab),
+    /// Pick a job of the run.
+    SelectJob(usize),
+    /// Open the log of the selected job.
+    OpenLog,
+    /// Ask the AI why the selected job (or the first failed one) failed.
+    Explain,
+    /// AI triage of the shown inbox: now, fyi or ignore, for the hosts that allowed it.
+    AiTriage,
+    /// An AI draft about the selected pull request (summary, catch-up or review notes).
+    AiPr(gitkraft_hub::review_ai::Action),
+    /// Review notes from the model: they go into the comment box to be edited and posted.
+    ReviewDrafted(Result<String, String>),
+    /// A log arrived.
+    LogLoaded(Result<(String, String), String>),
+    /// Close the log.
+    CloseLog,
+    /// Jump to a log line.
+    JumpLog(usize),
+    /// The log search text changed.
+    LogQuery(String),
+    /// Next (`true`) or previous log search match.
+    LogStep(bool),
+    /// The log was scrolled to this offset, in a view of this height.
+    LogScrolled(f32, f32),
+    /// The note / comment text changed.
+    NoteInput(String),
+    /// Post the note as a comment.
+    PostComment,
+    /// Approve with the note.
+    Approve,
+    /// Request changes with the note.
+    RequestChanges,
+    /// Merge.
+    Merge(MergeMethod),
+    /// Merge when the checks pass, through the queue, or forced (two clicks).
+    MergeWith(MergeTiming, bool),
+    /// Bring the branch up to date with its target.
+    UpdateBranch,
+    /// Cancel a scheduled auto-merge or leave the merge queue.
+    CancelAutoMerge,
+    /// Cycle the method used by the auto-merge, queue and force buttons.
+    CycleMethod,
+    /// Close or reopen.
+    ToggleOpen,
+    /// Re-run CI.
+    Rerun(RerunScope),
+    /// Cancel the run.
+    CancelRun,
+    /// Download the selected run's artifacts.
+    Artifacts,
+    /// Check the selected pull request out into a worktree.
+    Worktree,
+    /// Open the selected item on its forge's web page.
+    OpenInBrowser,
+    /// Add and remove labels as typed in the note box (`+bug -wontfix`).
+    EditLabels,
+    /// Select a diff line.
+    DiffLine(usize),
+    /// The PR diff scrolled: offset and visible height.
+    DiffScrolled(f32, f32),
+    /// Comment on the selected diff line with the note text.
+    InlineComment,
+    /// Start the selected run's workflow again, with the note as `[WORKFLOW] REF key=value…`.
+    Dispatch,
+    /// An action finished.
+    ActionDone(Result<String, String>),
+    /// A drag of section tab `i` began.
+    DragStart(usize),
+    /// The pointer entered tab `i` while dragging.
+    DragEnter(usize),
+    /// The button was released over tab `i`.
+    DragDrop(usize),
+    /// The button was released elsewhere.
+    DragCancel,
+    /// The list of discussions or wiki pages arrived.
+    CommunityLoaded {
+        repo: String,
+        tab: gitkraft_hub::community::Tab,
+        result: Result<Vec<gitkraft_hub::community::Item>, String>,
+    },
+    /// An open discussion or wiki page arrived.
+    CommunityPageLoaded {
+        repo: String,
+        tab: gitkraft_hub::community::Tab,
+        result: Result<gitkraft_hub::community::Page, String>,
+    },
+    /// Show discussions or the wiki.
+    CommunityTab(gitkraft_hub::community::Tab),
+    /// Open list entry `i`.
+    CommunityOpen(usize),
+    /// The next (+1) or previous (-1) watched repository.
+    CommunityRepo(isize),
+    /// Post the note as a comment on the open discussion (a reply when one is chosen).
+    CommunityComment,
+    /// Answer this comment of the open discussion next (`None` goes back to a top-level comment).
+    CommunityReplyTo(Option<(u64, String)>),
+    /// Add a card: the note is `title` or `title | column`.
+    CommunityNewCard,
+    /// Move the selected card inside its column.
+    CommunityShift(gitkraft_hub::community::Shift),
+    /// Open an address (an entry of the calendar day) in the browser.
+    OpenUrl(String),
+    /// Mark this comment (its id) of the open discussion as the answer.
+    CommunityAnswer(u64),
+    /// Move the selected board card to the column the note names.
+    CommunityMove,
+    /// Write the open wiki page to a file and open it in the editor.
+    WikiEdit,
+    /// Start a new wiki page titled by the note.
+    WikiNew,
+    /// Send the edited wiki file back.
+    WikiUpload,
+    /// A write to the community view finished; reload what it changed.
+    CommunityWritten(Result<String, String>),
+    /// SSH keys arrived.
+    KeysLoaded(Arc<gitkraft_hub::keys::KeysData>),
+    /// Pick a key row.
+    SelectKey(usize),
+    /// Ask before removing the selected key.
+    AskRevoke,
+    /// Confirmed.
+    ConfirmRevoke,
+    /// Not now.
+    CancelRevoke,
+    /// Create or reuse this machine's key for a host, register it, configure ssh.
+    SetupKeys(String),
+    /// Test `ssh -T git@host`.
+    TestKeys(String),
+    /// A key action finished.
+    KeysActionDone(Result<String, String>),
+    /// A click in the Agents view.
+    Agent(gitkraft_hub::agent_watch::AgentAction),
+    /// The new-job name box changed.
+    AgentName(String),
+    /// The model box changed.
+    AgentModelInput(String),
+    /// Ask (true) or stop asking (false) before deleting the selected job.
+    AgentAskDelete(bool),
+    /// Typing the instructions.
+    AgentPromptInput(String),
+    /// Typing the globs.
+    AgentGlobsInput(String),
+    /// Save the instructions.
+    AgentSetPrompt,
+    /// Save the globs.
+    AgentSetGlobs,
+    /// Create the job named in the box.
+    AgentAdd,
+    /// Save the model box on the selected job.
+    AgentSetModel,
+    /// Reload jobs, reports and the repository list.
+    AgentReload,
+    /// Run a job now.
+    AgentRun(String),
+    /// The repositories of every account arrived.
+    AgentRepos(Arc<(Vec<gitkraft_platforms::model::RepoInfo>, Vec<String>)>),
+    /// A job finished; `quiet` when the scheduler started it.
+    AgentRan {
+        job: String,
+        quiet: bool,
+        result: Result<gitkraft_hub::agent_watch::Report, String>,
+    },
+    /// Pulse numbers arrived.
+    PulseLoaded {
+        repo: String,
+        days: u32,
+        data: Box<Pulse>,
+    },
+    /// A day of the contribution calendar was clicked (or stepped to).
+    PickDay(NaiveDate),
+    /// Step the selected day by this many days (the keyboard route to the calendar).
+    StepDay(i64),
+    /// What was done on a day arrived.
+    DayLoaded(Arc<gitkraft_hub::DayResult>),
+    /// Contributions arrived.
+    ContributionsLoaded(Arc<SectionResult<ActivityDay>>),
+    /// Load the pulse for another repo.
+    PulseRepo(usize),
+    /// Pulse period in days.
+    PulseDays(u32),
+    /// Switch notifications on or off for the current repo.
+    ToggleBell,
+    /// Open or close the command palette.
+    PaletteToggle,
+    /// The palette's search text changed.
+    PaletteQuery(String),
+    /// Run the n-th shown entry.
+    PaletteRun(usize),
+    /// Run the first shown entry (Enter).
+    PaletteSubmit,
+    /// A timer tick (poll, refresh the bell).
+    Tick,
+    /// The poller finished a cycle.
+    Polled,
+}
+
+/// One section's data.
+#[derive(Debug, Default)]
+pub struct Slot {
+    /// Loaded data.
+    pub data: Option<Arc<SectionData>>,
+    /// A load is running.
+    pub loading: bool,
+    generation: u64,
+}
+
+/// The detail pane's data.
+#[derive(Debug, Default)]
+pub struct Detail {
+    /// Key of the item shown.
+    pub key: Option<String>,
+    /// A PR with comments, reviews and diff.
+    pub pr: Option<Arc<PrDetail>>,
+    /// Issue comments.
+    pub comments: Vec<Comment>,
+    /// A run with jobs.
+    pub run: Option<Arc<RunDetail>>,
+    /// Loading.
+    pub loading: bool,
+    /// Failure.
+    pub error: Option<String>,
+    /// Selected job.
+    pub job: usize,
+    /// Diff line a comment would go on (index into the diff's lines).
+    pub diff_line: Option<usize>,
+    /// Scroll offset of the diff, and the height of its visible area, for drawing only the lines
+    /// in view.
+    pub diff_scroll: f32,
+    /// Height of the diff area as last reported by the scroll area.
+    pub diff_view_h: f32,
+}
+
+impl Detail {
+    /// The diff lines to draw: those in view plus some either side.
+    pub fn diff_window(&self, len: usize) -> std::ops::Range<usize> {
+        line_window(self.diff_scroll, self.diff_view_h, len)
+    }
+}
+
+/// The lines of a list of fixed-height (`LOG_LINE_H`) lines to draw: those in the visible area
+/// plus `LOG_OVERSCAN` either side. Before the first scroll report (`view_h` 0) one screenful.
+pub fn line_window(scroll_y: f32, view_h: f32, len: usize) -> std::ops::Range<usize> {
+    let view_h = if view_h > 0.0 { view_h } else { 1200.0 };
+    let first = ((scroll_y / LOG_LINE_H) as usize).saturating_sub(LOG_OVERSCAN);
+    let count = (view_h / LOG_LINE_H) as usize + 2 * LOG_OVERSCAN;
+    first.min(len)..(first + count).min(len)
+}
+
+/// A log being read.
+#[derive(Debug)]
+pub struct LogState {
+    /// Title.
+    pub title: String,
+    /// Parsed lines.
+    pub lines: Vec<LogLine>,
+    /// Problems found.
+    pub annotations: Vec<Annotation>,
+    /// Line to highlight (from a jump).
+    pub focus: Option<usize>,
+    /// What the search box holds.
+    pub query: String,
+    /// Lines matching `query`.
+    pub matches: Vec<usize>,
+    /// Scroll offset in pixels, and the height of the visible area, for drawing only the lines in view.
+    pub scroll_y: f32,
+    /// Height of the log area as last reported by the scroll area.
+    pub view_h: f32,
+}
+
+impl LogState {
+    /// The lines to draw: those in view plus some either side.
+    pub fn window(&self) -> std::ops::Range<usize> {
+        line_window(self.scroll_y, self.view_h, self.lines.len())
+    }
+}
+
+impl LogState {
+    /// Moves the focus to the next (or previous) match, wrapping round; the line to scroll to.
+    pub fn step(&mut self, forward: bool) -> Option<usize> {
+        let n = self.matches.len();
+        if n == 0 {
+            return None;
+        }
+        let at = self
+            .focus
+            .and_then(|f| self.matches.iter().position(|&m| m == f));
+        let next = match (at, forward) {
+            (None, true) => self
+                .matches
+                .iter()
+                .position(|&m| Some(m) > self.focus)
+                .unwrap_or(0),
+            (None, false) => self
+                .matches
+                .iter()
+                .rposition(|&m| Some(m) < self.focus)
+                .unwrap_or(n - 1),
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+        };
+        self.focus = Some(self.matches[next]);
+        self.focus
+    }
+}
+
+/// Height of one log line in pixels (lines never wrap, so all are the same).
+pub const LOG_LINE_H: f32 = 16.0;
+/// Lines drawn above and below the visible ones.
+const LOG_OVERSCAN: usize = 20;
+
+/// Id of the log's scroll area.
+pub const LOG_SCROLL: &str = "hub-log";
+
+/// Pulse view state.
+#[derive(Debug, Default)]
+pub struct PulseState {
+    /// Repo shown.
+    pub repo: Option<RepoId>,
+    /// Numbers.
+    pub data: Option<Pulse>,
+    /// Contribution calendar.
+    pub contributions: Option<Arc<SectionResult<ActivityDay>>>,
+    /// Days covered.
+    pub days: u32,
+    /// The day picked on the calendar.
+    pub day: Option<NaiveDate>,
+    /// What was done that day, once loaded.
+    pub day_data: Option<Arc<gitkraft_hub::DayResult>>,
+}
+
+/// Discussions and wiki view state.
+#[derive(Debug, Default)]
+pub struct CommunityState {
+    /// Repository shown.
+    pub repo: Option<RepoId>,
+    /// Discussions or wiki.
+    pub tab: gitkraft_hub::community::Tab,
+    /// The list, once loaded.
+    pub items: Option<Vec<gitkraft_hub::community::Item>>,
+    /// Row opened (or about to be).
+    pub row: usize,
+    /// The open page.
+    pub page: Option<gitkraft_hub::community::Page>,
+    /// The comment the next send answers: its id and author.
+    pub reply_to: Option<(u64, String)>,
+    /// The wiki page being edited in an editor; [`HubMessage::WikiUpload`] sends it back.
+    pub wiki_draft: Option<gitkraft_hub::community::WikiDraft>,
+    /// The draft was just written: the app opens it in the editor.
+    pub open_draft: bool,
+    /// Why the list could not be loaded.
+    pub error: Option<String>,
+    /// A load is running.
+    pub loading: bool,
+}
+
+/// SSH keys view state.
+#[derive(Debug, Default)]
+pub struct KeysState {
+    /// Loaded keys.
+    pub data: Option<Arc<gitkraft_hub::keys::KeysData>>,
+    /// Selected row.
+    pub row: usize,
+    /// A load is running.
+    pub loading: bool,
+    /// Waiting for a yes on removing the selected key.
+    pub confirm_revoke: bool,
+}
+
+/// The bell of the current repo.
+#[derive(Debug, Clone)]
+pub struct Bell {
+    /// Project key.
+    pub key: String,
+    /// Status.
+    pub status: NotifyStatus,
+    /// Unread inbox entries.
+    pub unread: usize,
+}
+
+/// Everything the hub screen needs.
+#[derive(Debug)]
+pub struct HubState {
+    /// Active view.
+    pub view: HubView,
+    /// The dashboard.
+    pub dashboard: Dashboard,
+    /// Data per section.
+    pub slots: Vec<Slot>,
+    /// Active section (visible index).
+    pub active: usize,
+    /// Selected row.
+    pub row: Option<usize>,
+    /// Detail pane.
+    pub detail: Detail,
+    /// PR tab.
+    pub tab: PrTab,
+    /// Log viewer.
+    pub log: Option<LogState>,
+    /// Comment / note input.
+    pub note: String,
+    /// Method for the auto-merge, queue and force buttons.
+    pub merge_method: MergeMethod,
+    /// The Force merge button was clicked once and waits for a second click.
+    pub force_armed: bool,
+    /// Section drag: `(from, over)`.
+    pub drag: Option<(usize, usize)>,
+    /// Pulse view.
+    pub pulse: PulseState,
+    /// SSH keys view.
+    pub keys: KeysState,
+    /// Agents view.
+    pub agents: gitkraft_hub::agent_watch::AgentsState,
+    /// The new-job name box.
+    pub agent_name: String,
+    /// The model box.
+    pub agent_model: String,
+    /// Waiting for the second click that deletes the selected job.
+    pub agent_confirm_delete: bool,
+    /// The instructions box.
+    pub agent_prompt: String,
+    /// The globs box.
+    pub agent_globs: String,
+    /// Discussions and wiki.
+    pub community: CommunityState,
+    /// Status line text and success flag.
+    pub notice: Option<(String, bool)>,
+    /// Setup finished.
+    pub ready: bool,
+    /// Accounts found.
+    pub accounts: usize,
+    /// Watched projects.
+    pub watched: Vec<RepoId>,
+    /// The remotes of the first open checkout (GitHub, Codeberg, Gitea, …).
+    pub project: gitkraft_hub::project::Project,
+    /// Which of them the lists show.
+    pub scope: gitkraft_hub::project::Scope,
+    /// Where `ai-policy.toml` lives; `None` keeps every AI draft off.
+    pub ai_dir: Option<std::path::PathBuf>,
+    /// Where each remote stands against the checked-out branch (as of the last fetch).
+    pub sync: Vec<gitkraft_hub::project::RemoteSync>,
+    /// The command palette's search text while open.
+    pub palette: Option<String>,
+    /// Open local checkouts, by project.
+    pub checkouts: Vec<(RepoId, std::path::PathBuf)>,
+    /// Parsed `notifications.toml`.
+    pub notify_config: NotifyConfig,
+    /// A notification poll is running; the next tick waits for it instead of queueing behind its lock.
+    polling: bool,
+    /// The bell of the current repo.
+    pub bell: Option<Bell>,
+    api: Option<ApiHandle>,
+    engine: Arc<tokio::sync::Mutex<Engine>>,
+    dashboard_file: Option<PathBuf>,
+    notify_file: Option<PathBuf>,
+}
+
+impl HubState {
+    /// A state without network access (tests, and before setup finishes).
+    pub fn detached(dashboard: Dashboard) -> Self {
+        let slots = dashboard.sections.iter().map(|_| Slot::default()).collect();
+        Self {
+            view: HubView::Dashboard,
+            dashboard,
+            slots,
+            active: 0,
+            row: None,
+            detail: Detail::default(),
+            tab: PrTab::Overview,
+            log: None,
+            note: String::new(),
+            merge_method: MergeMethod::Merge,
+            force_armed: false,
+            drag: None,
+            pulse: PulseState::default(),
+            keys: KeysState::default(),
+            agents: gitkraft_hub::agent_watch::AgentsState::default(),
+            agent_name: String::new(),
+            agent_model: String::new(),
+            agent_confirm_delete: false,
+            agent_prompt: String::new(),
+            agent_globs: String::new(),
+            community: CommunityState::default(),
+            notice: None,
+            ready: false,
+            accounts: 0,
+            watched: Vec::new(),
+            project: gitkraft_hub::project::Project::default(),
+            scope: gitkraft_hub::project::Scope::All,
+            ai_dir: gitkraft_hub::commit_ai::global_dir(),
+            sync: Vec::new(),
+            palette: None,
+            checkouts: Vec::new(),
+            notify_config: NotifyConfig::default(),
+            polling: false,
+            bell: None,
+            api: None,
+            engine: Arc::new(tokio::sync::Mutex::new(Engine::default())),
+            dashboard_file: None,
+            notify_file: None,
+        }
+    }
+
+    /// Opens the hub: loads the dashboard file and starts discovering accounts.
+    pub fn open(tabs: Vec<(Option<std::path::PathBuf>, Vec<String>)>) -> (Self, Task<HubMessage>) {
+        let checkouts = gitkraft_hub::checkout::local_checkouts(&tabs);
+        let first_dir = tabs.iter().find_map(|(p, _)| p.clone());
+        let repos: Vec<Vec<String>> = tabs.into_iter().map(|(_, urls)| urls).collect();
+        let mut notice = None;
+        let dashboard = match files::dashboard_path()
+            .ok()
+            .and_then(|p| files::read_optional(&p).ok().flatten())
+        {
+            Some(text) => Dashboard::parse(&text).unwrap_or_else(|e| {
+                notice = Some(format!("dashboard.toml: {e}; showing the default"));
+                Dashboard::starter()
+            }),
+            None => Dashboard::starter(),
+        };
+        let mut state = Self::detached(dashboard);
+        state.checkouts = checkouts;
+        if let Some(dir) = first_dir {
+            state.project = gitkraft_hub::project::Project::of_dir(&dir);
+            state.sync = gitkraft_hub::project::sync_status(&dir, &state.project);
+        }
+        state.dashboard_file = files::dashboard_path().ok();
+        state.notify_file = files::notify_config_path().ok();
+        state.notify_config = read_config(state.notify_file.as_deref());
+        if let Some(n) = notice {
+            state.notice = Some((n, false));
+        }
+        let sections: Vec<String> = state
+            .dashboard
+            .sections
+            .iter()
+            .flat_map(|s| s.repos.clone())
+            .collect();
+        let task = Task::perform(setup(repos, sections), HubMessage::Ready);
+        (state, task)
+    }
+
+    /// More than one forge is involved, so rows say which one they come from.
+    pub fn is_multi(&self) -> bool {
+        self.project.is_multi()
+    }
+
+    /// `⎇ all remotes  origin ✔  codeberg ↑1`: the scope and where each remote stands.
+    pub fn scope_text(&self) -> String {
+        use gitkraft_hub::project::SyncState::{Ahead, Behind, Diverged, InSync, Missing};
+        if self.project.remotes.is_empty() {
+            return String::new();
+        }
+        let mut out = format!("⎇ {}", self.scope.label(&self.project));
+        if self.project.is_multi() {
+            for r in &self.project.remotes {
+                let mark = match self
+                    .sync
+                    .iter()
+                    .find(|s| s.remote == r.name)
+                    .map(|s| s.state)
+                {
+                    Some(InSync) => " ✔".to_string(),
+                    Some(Ahead(n)) => format!(" ↑{n}"),
+                    Some(Behind(n)) => format!(" ↓{n}"),
+                    Some(Diverged { .. }) => " ⇄".to_string(),
+                    Some(Missing) => " ∅".to_string(),
+                    None => String::new(),
+                };
+                out.push_str(&format!("  {}{mark}", r.name));
+            }
+        }
+        out
+    }
+
+    /// Indexes into `dashboard.sections` of the shown sections.
+    pub fn visible_sections(&self) -> Vec<usize> {
+        self.dashboard.visible().map(|(i, _)| i).collect()
+    }
+
+    /// The active section's index in `dashboard.sections`.
+    pub fn active_index(&self) -> Option<usize> {
+        self.visible_sections().get(self.active).copied()
+    }
+
+    /// The active section's data.
+    pub fn active_data(&self) -> Option<&SectionData> {
+        self.slots.get(self.active_index()?)?.data.as_deref()
+    }
+
+    /// Repo of the selected item, else the first watched repo.
+    pub fn current_repo(&self) -> Option<RepoId> {
+        let row = self.row?;
+        let from_row = match self.active_data()? {
+            SectionData::Prs(r) => r.items.get(row).map(|p| p.repo.clone()),
+            SectionData::Issues(r) => r.items.get(row).map(|i| i.repo.clone()),
+            SectionData::Runs(r) => r.items.get(row).map(|x| x.repo.clone()),
+            SectionData::Inbox(r) => r.items.get(row).and_then(|n| n.repo.clone()),
+        };
+        from_row.or_else(|| self.watched.first().cloned())
+    }
+
+    fn repo_for_bell(&self) -> Option<RepoId> {
+        self.current_repo()
+            .or_else(|| self.watched.first().cloned())
+    }
+
+    fn handle(&self) -> Option<Arc<Api>> {
+        self.api.as_ref().map(|a| a.0.clone())
+    }
+
+    /// Updates the state; returns follow-up work.
+    pub fn update(&mut self, msg: HubMessage) -> Task<HubMessage> {
+        // A forced merge is armed by one click and fired by the next; anything else disarms it.
+        if !matches!(msg, HubMessage::MergeWith(_, true)) {
+            self.force_armed = false;
+        }
+        match msg {
+            // Open and Close are handled by the app, which owns the screen.
+            HubMessage::Open | HubMessage::Close => Task::none(),
+            HubMessage::Ready(Ok(setup)) => {
+                self.ready = true;
+                self.accounts = setup.accounts;
+                self.watched = setup.watched;
+                self.api = Some(setup.api);
+                if self.agents.dir.is_none() {
+                    self.agents = gitkraft_hub::agent_watch::AgentsState::system();
+                    self.agents.reload();
+                    self.sync_agent_inputs();
+                }
+                if self.accounts == 0 {
+                    self.notice = Some(("No accounts: set GITHUB_TOKEN / GITLAB_TOKEN / CODEBERG_TOKEN or log in with `gh`".into(), false));
+                }
+                self.load_all()
+            }
+            HubMessage::Ready(Err(e)) => {
+                self.ready = true;
+                self.notice = Some((e, false));
+                Task::none()
+            }
+            HubMessage::Show(v) => {
+                self.view = v;
+                if v == HubView::Pulse && self.pulse.data.is_none() {
+                    return self.load_pulse(30);
+                }
+                if v == HubView::Keys && self.keys.data.is_none() && !self.keys.loading {
+                    return self.load_keys();
+                }
+                if v == HubView::Agents {
+                    self.agents.reload();
+                    self.agents.mark_seen();
+                    if self.agents.repos.is_none() {
+                        return self.load_agent_repos();
+                    }
+                }
+                if v == HubView::Community
+                    && self.community.items.is_none()
+                    && self.community.error.is_none()
+                    && !self.community.loading
+                {
+                    return self.load_community();
+                }
+                Task::none()
+            }
+            HubMessage::SelectSection(vis) => self.select_section(vis),
+            HubMessage::SelectRow(i) => {
+                self.row = Some(i);
+                self.log = None;
+                self.on_selection()
+            }
+            HubMessage::CycleScope => {
+                if !self.project.is_multi() {
+                    self.notice = Some((
+                        "this project has a single forge remote: nothing to switch".into(),
+                        false,
+                    ));
+                    return Task::none();
+                }
+                self.scope = self.scope.next(&self.project);
+                self.notice = Some((format!("showing {}", self.scope.label(&self.project)), true));
+                for slot in &mut self.slots {
+                    if let Some(data) = slot.data.as_mut() {
+                        std::sync::Arc::make_mut(data).retain_scope(&self.scope);
+                    }
+                }
+                self.row = None;
+                self.load_all()
+            }
+            HubMessage::Refresh => match self.active_index() {
+                Some(i) => self.load_section(i),
+                None => Task::none(),
+            },
+            HubMessage::SectionLoaded {
+                idx,
+                generation,
+                data,
+            } => {
+                let Some(slot) = self.slots.get_mut(idx) else {
+                    return Task::none();
+                };
+                if slot.generation != generation {
+                    return Task::none();
+                }
+                slot.loading = false;
+                if let Some(first) = data.errors().first() {
+                    self.notice = Some((first.clone(), false));
+                }
+                let mut data = data;
+                std::sync::Arc::make_mut(&mut data).retain_scope(&self.scope);
+                slot.data = Some(data);
+                if self.active_index() == Some(idx) {
+                    let len = self.active_data().map_or(0, SectionData::len);
+                    self.row =
+                        self.row
+                            .filter(|r| *r < len)
+                            .or(if len > 0 { Some(0) } else { None });
+                    self.detail.key = None;
+                    return self.on_selection();
+                }
+                Task::none()
+            }
+            HubMessage::PrLoaded { key, result } => {
+                if self.detail.key.as_deref() != Some(&key) {
+                    return Task::none();
+                }
+                self.detail.loading = false;
+                match result {
+                    Ok(d) => {
+                        if let Some(e) = d.errors.first() {
+                            self.notice = Some((e.clone(), false));
+                        }
+                        self.detail.pr = Some(d);
+                    }
+                    Err(e) => self.detail.error = Some(e),
+                }
+                Task::none()
+            }
+            HubMessage::CommentsLoaded { key, result } => {
+                if self.detail.key.as_deref() == Some(&key) {
+                    self.detail.loading = false;
+                    match result {
+                        Ok(c) => self.detail.comments = c,
+                        Err(e) => self.detail.error = Some(e),
+                    }
+                }
+                Task::none()
+            }
+            HubMessage::RunLoaded { key, result } => {
+                if self.detail.key.as_deref() == Some(&key) {
+                    self.detail.loading = false;
+                    match result {
+                        Ok(d) => self.detail.run = Some(d),
+                        Err(e) => self.detail.error = Some(e),
+                    }
+                }
+                Task::none()
+            }
+            HubMessage::Tab(t) => {
+                self.tab = t;
+                // The diff's scroll area starts at the top again when its tab comes back.
+                self.detail.diff_scroll = 0.0;
+                Task::none()
+            }
+            HubMessage::SelectJob(i) => {
+                self.detail.job = i;
+                Task::none()
+            }
+            HubMessage::OpenLog => self.open_log(),
+            HubMessage::Explain => self.explain(),
+            HubMessage::AiPr(a) => self.ai_pr(a),
+            HubMessage::ReviewDrafted(result) => {
+                match result {
+                    Ok(text) => {
+                        self.note = text.trim().to_string();
+                        self.notice = Some((
+                            "review draft is in the comment box: edit it, then Comment".into(),
+                            true,
+                        ));
+                    }
+                    Err(e) => self.notice = Some((format!("review draft: {e}"), false)),
+                }
+                Task::none()
+            }
+            HubMessage::AiTriage => self.ai_triage(),
+            HubMessage::LogLoaded(Ok((title, raw))) => {
+                let lines = parse_log(&raw);
+                let annotations = extract(&lines);
+                let focus = first_failure(&lines);
+                self.log = Some(LogState {
+                    title,
+                    lines,
+                    annotations,
+                    focus,
+                    query: String::new(),
+                    matches: Vec::new(),
+                    scroll_y: 0.0,
+                    view_h: 1200.0,
+                });
+                self.notice = None;
+                Task::none()
+            }
+            HubMessage::LogLoaded(Err(e)) => {
+                self.notice = Some((format!("log: {e}"), false));
+                Task::none()
+            }
+            HubMessage::CloseLog => {
+                self.log = None;
+                Task::none()
+            }
+            HubMessage::JumpLog(i) => {
+                let Some(l) = &mut self.log else {
+                    return Task::none();
+                };
+                l.focus = Some(i);
+                scroll_log(l, i)
+            }
+            HubMessage::LogQuery(q) => {
+                let Some(l) = &mut self.log else {
+                    return Task::none();
+                };
+                l.matches = gitkraft_ci::log::search(&l.lines, &q);
+                l.query = q;
+                l.focus = None;
+                match l.step(true) {
+                    Some(i) => scroll_log(l, i),
+                    None => Task::none(),
+                }
+            }
+            HubMessage::LogScrolled(y, h) => {
+                if let Some(l) = &mut self.log {
+                    l.scroll_y = y;
+                    l.view_h = h;
+                }
+                Task::none()
+            }
+            HubMessage::LogStep(forward) => {
+                let Some(l) = &mut self.log else {
+                    return Task::none();
+                };
+                match l.step(forward) {
+                    Some(i) => scroll_log(l, i),
+                    None => Task::none(),
+                }
+            }
+            HubMessage::NoteInput(t) => {
+                self.note = t;
+                Task::none()
+            }
+            HubMessage::PostComment => self.post_comment(),
+            HubMessage::Approve => self.review(ReviewVerdict::Approve),
+            HubMessage::RequestChanges => self.review(ReviewVerdict::RequestChanges),
+            HubMessage::Merge(m) => self.merge(m),
+            HubMessage::MergeWith(timing, force) => self.merge_with(timing, force),
+            HubMessage::UpdateBranch => self.update_branch(),
+            HubMessage::CancelAutoMerge => self.cancel_auto_merge(),
+            HubMessage::CycleMethod => {
+                self.merge_method = self.merge_method.next();
+                Task::none()
+            }
+            HubMessage::ToggleOpen => self.toggle_open(),
+            HubMessage::Rerun(scope) => self.rerun(scope),
+            HubMessage::CancelRun => self.cancel_run(),
+            HubMessage::Dispatch => self.dispatch(),
+            HubMessage::Artifacts => self.artifacts(),
+            HubMessage::Worktree => self.worktree(),
+            HubMessage::OpenInBrowser => {
+                self.open_in_browser();
+                Task::none()
+            }
+            HubMessage::DiffScrolled(y, h) => {
+                self.detail.diff_scroll = y;
+                self.detail.diff_view_h = h;
+                Task::none()
+            }
+            HubMessage::DiffLine(i) => {
+                self.detail.diff_line = Some(i);
+                Task::none()
+            }
+            HubMessage::InlineComment => self.inline_comment(),
+            HubMessage::EditLabels => self.edit_labels(),
+            HubMessage::PaletteToggle => {
+                self.palette = match self.palette {
+                    Some(_) => None,
+                    None => Some(String::new()),
+                };
+                if self.palette.is_some() {
+                    iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT))
+                } else {
+                    Task::none()
+                }
+            }
+            HubMessage::PaletteQuery(q) => {
+                self.palette = Some(q);
+                Task::none()
+            }
+            HubMessage::PaletteSubmit => self.palette_run(0),
+            HubMessage::PaletteRun(n) => self.palette_run(n),
+            HubMessage::ActionDone(result) => {
+                match result {
+                    Ok(text) => {
+                        self.notice = Some((text, true));
+                        self.note.clear();
+                        self.detail.key = None;
+                        return match self.active_index() {
+                            Some(i) => self.load_section(i),
+                            None => Task::none(),
+                        };
+                    }
+                    Err(e) => self.notice = Some((e, false)),
+                }
+                Task::none()
+            }
+            HubMessage::DragStart(i) => {
+                self.drag = Some((i, i));
+                Task::none()
+            }
+            HubMessage::DragEnter(i) => {
+                if let Some((from, _)) = self.drag {
+                    self.drag = Some((from, i));
+                }
+                Task::none()
+            }
+            HubMessage::DragDrop(to) => {
+                let Some((from, _)) = self.drag.take() else {
+                    return Task::none();
+                };
+                if from == to {
+                    return self.select_section(to);
+                }
+                if self.reorder_sections(from, to) {
+                    self.notice = Some(("section moved".into(), true));
+                }
+                Task::none()
+            }
+            HubMessage::DragCancel => {
+                self.drag = None;
+                Task::none()
+            }
+            HubMessage::CommunityLoaded { repo, tab, result } => {
+                if self.community.repo.as_ref().map(RepoId::key) == Some(repo)
+                    && self.community.tab == tab
+                {
+                    self.community.loading = false;
+                    match result {
+                        Ok(items) => {
+                            self.community.error = None;
+                            self.community.row =
+                                self.community.row.min(items.len().saturating_sub(1));
+                            self.community.items = Some(items);
+                        }
+                        Err(e) => {
+                            self.community.items = None;
+                            self.community.error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            HubMessage::CommunityPageLoaded { repo, tab, result } => {
+                if self.community.repo.as_ref().map(RepoId::key) == Some(repo)
+                    && self.community.tab == tab
+                {
+                    match result {
+                        Ok(p) => self.community.page = Some(p),
+                        Err(e) => self.notice = Some((e, false)),
+                    }
+                }
+                Task::none()
+            }
+            HubMessage::CommunityTab(tab) => {
+                if self.community.tab != tab {
+                    self.community.tab = tab;
+                    self.community.row = 0;
+                    return self.load_community();
+                }
+                Task::none()
+            }
+            HubMessage::CommunityOpen(i) => self.open_community(i),
+            HubMessage::CommunityRepo(delta) => {
+                if self.watched.is_empty() {
+                    return Task::none();
+                }
+                let cur = self
+                    .community
+                    .repo
+                    .as_ref()
+                    .and_then(|r| self.watched.iter().position(|w| w == r))
+                    .unwrap_or(0);
+                let next = (cur as isize + delta).rem_euclid(self.watched.len() as isize) as usize;
+                self.community.repo = Some(self.watched[next].clone());
+                self.load_community()
+            }
+            HubMessage::CommunityComment => self.comment_on_discussion(),
+            HubMessage::CommunityReplyTo(to) => {
+                self.community.reply_to = to;
+                Task::none()
+            }
+            HubMessage::OpenUrl(url) => {
+                if url.is_empty() {
+                    self.notice = Some(("this entry has no address".into(), false));
+                } else if let Err(e) = gitkraft_core::open_file_default(std::path::Path::new(&url))
+                {
+                    self.notice = Some((format!("could not open {url}: {e}"), false));
+                }
+                Task::none()
+            }
+            HubMessage::CommunityNewCard => self.new_card(),
+            HubMessage::CommunityShift(s) => self.shift_card(s),
+            HubMessage::CommunityAnswer(id) => self.mark_answer(id),
+            HubMessage::CommunityMove => self.move_card(),
+            HubMessage::WikiEdit => {
+                self.start_wiki_edit(None);
+                Task::none()
+            }
+            HubMessage::WikiNew => {
+                let title = self.note.trim().to_string();
+                if title.is_empty() {
+                    self.notice = Some(("type the new page's title in the box".into(), false));
+                } else {
+                    self.start_wiki_edit(Some(title));
+                    self.note.clear();
+                }
+                Task::none()
+            }
+            HubMessage::WikiUpload => self.upload_wiki(),
+            HubMessage::CommunityWritten(result) => {
+                match result {
+                    Ok(text) => {
+                        self.notice = Some((text, true));
+                        // what was written shows: the list and the open page are read again
+                        let reopen = self
+                            .community
+                            .page
+                            .as_ref()
+                            .filter(|p| !p.key.is_empty())
+                            .map(|p| gitkraft_hub::community::Item {
+                                key: p.key.clone(),
+                                title: p.title.clone(),
+                                ..Default::default()
+                            });
+                        let list = self.load_community_keep_page();
+                        let (Some(item), Some(api), Some(repo)) =
+                            (reopen, self.handle(), self.community.repo.clone())
+                        else {
+                            return list;
+                        };
+                        let (tab, key) = (self.community.tab, repo.key());
+                        return Task::batch([
+                            list,
+                            Task::perform(
+                                async move {
+                                    gitkraft_hub::community::page(&api, &repo, tab, &item).await
+                                },
+                                move |result| HubMessage::CommunityPageLoaded {
+                                    repo: key.clone(),
+                                    tab,
+                                    result,
+                                },
+                            ),
+                        ]);
+                    }
+                    Err(e) => self.notice = Some((e, false)),
+                }
+                Task::none()
+            }
+            HubMessage::KeysLoaded(data) => {
+                self.keys.loading = false;
+                if let Some(e) = data.errors.first() {
+                    self.notice = Some((e.clone(), false));
+                }
+                self.keys.row = self.keys.row.min(data.rows.len().saturating_sub(1));
+                self.keys.data = Some(data);
+                Task::none()
+            }
+            HubMessage::AgentAskDelete(on) => {
+                self.agent_confirm_delete = on;
+                Task::none()
+            }
+            HubMessage::Agent(a) => {
+                self.agent_confirm_delete = false;
+                let r = self.agents.apply(&a);
+                if matches!(
+                    a,
+                    gitkraft_hub::agent_watch::AgentAction::SelectJob(_)
+                        | gitkraft_hub::agent_watch::AgentAction::AddJob(_)
+                        | gitkraft_hub::agent_watch::AgentAction::DeleteJob
+                ) {
+                    self.sync_agent_inputs();
+                }
+                self.agent_note(r);
+                Task::none()
+            }
+            HubMessage::AgentName(t) => {
+                self.agent_name = t;
+                Task::none()
+            }
+            HubMessage::AgentPromptInput(t) => {
+                self.agent_prompt = t;
+                Task::none()
+            }
+            HubMessage::AgentGlobsInput(t) => {
+                self.agent_globs = t;
+                Task::none()
+            }
+            HubMessage::AgentSetPrompt => {
+                let r = self.agents.set_prompt(&self.agent_prompt);
+                self.agent_note(r);
+                Task::none()
+            }
+            HubMessage::AgentSetGlobs => {
+                let r = self.agents.set_globs(&self.agent_globs);
+                self.agent_note(r);
+                Task::none()
+            }
+            HubMessage::AgentModelInput(t) => {
+                self.agent_model = t;
+                Task::none()
+            }
+            HubMessage::AgentAdd => {
+                let name = std::mem::take(&mut self.agent_name);
+                let r = self
+                    .agents
+                    .apply(&gitkraft_hub::agent_watch::AgentAction::AddJob(name));
+                self.agent_model.clear();
+                self.agent_note(r);
+                Task::none()
+            }
+            HubMessage::AgentSetModel => {
+                let m = self.agent_model.clone();
+                let r = self
+                    .agents
+                    .apply(&gitkraft_hub::agent_watch::AgentAction::SetModel(m));
+                self.agent_note(r);
+                Task::none()
+            }
+            HubMessage::AgentReload => {
+                self.agents.reload();
+                self.agents.repos = None;
+                self.load_agent_repos()
+            }
+            HubMessage::AgentRepos(data) => {
+                self.agents.loading_repos = false;
+                self.agents.repos = Some(data.0.clone());
+                self.agents.repo_errors = data.1.clone();
+                Task::none()
+            }
+            HubMessage::AgentRun(name) => self.run_agent(&name, false),
+            HubMessage::AgentRan { job, quiet, result } => {
+                self.agents.running = None;
+                self.agents.reload();
+                match result {
+                    Ok(r) => self.notice = Some((format!("{job}: {}", r.line()), !r.needs_you())),
+                    Err(e) if !quiet => self.notice = Some((format!("{job}: {e}"), false)),
+                    Err(_) => {}
+                }
+                Task::none()
+            }
+            HubMessage::SelectKey(i) => {
+                self.keys.row = i;
+                self.keys.confirm_revoke = false;
+                Task::none()
+            }
+            HubMessage::AskRevoke => {
+                if self.selected_key().is_some() {
+                    self.keys.confirm_revoke = true;
+                } else {
+                    self.notice = Some(("select a key first".into(), false));
+                }
+                Task::none()
+            }
+            HubMessage::CancelRevoke => {
+                self.keys.confirm_revoke = false;
+                Task::none()
+            }
+            HubMessage::ConfirmRevoke => {
+                self.keys.confirm_revoke = false;
+                let (Some(api), Some(row)) = (self.handle(), self.selected_key().cloned()) else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move { gitkraft_hub::keys::revoke(&api, &row.host, &row.key.id).await },
+                    HubMessage::KeysActionDone,
+                )
+            }
+            HubMessage::SetupKeys(host) => {
+                let Some(api) = self.handle() else {
+                    self.notice = Some(("no account to set up".into(), false));
+                    return Task::none();
+                };
+                self.notice = Some((format!("setting up ssh for {host}…"), true));
+                Task::perform(
+                    async move {
+                        let dir = ssh_dir();
+                        gitkraft_hub::keys::setup_host(
+                            &api,
+                            &host,
+                            &dir,
+                            &gitkraft_platforms::ssh::SystemSsh,
+                            &machine_name(),
+                        )
+                        .await
+                        .map(|t| t.lines().collect::<Vec<_>>().join(" · "))
+                    },
+                    HubMessage::KeysActionDone,
+                )
+            }
+            HubMessage::TestKeys(host) => {
+                self.notice = Some((format!("testing ssh to {host}…"), true));
+                Task::perform(
+                    async move {
+                        let (p, line) = tokio::task::spawn_blocking(move || {
+                            gitkraft_hub::keys::test_host(
+                                &gitkraft_platforms::ssh::SystemSsh,
+                                &host,
+                            )
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if matches!(p, gitkraft_platforms::ssh::Probe::Authenticated { .. }) {
+                            Ok(line)
+                        } else {
+                            Err(line)
+                        }
+                    },
+                    HubMessage::KeysActionDone,
+                )
+            }
+            HubMessage::KeysActionDone(result) => {
+                match result {
+                    Ok(t) => self.notice = Some((t, true)),
+                    Err(e) => self.notice = Some((e, false)),
+                }
+                self.load_keys()
+            }
+            HubMessage::PulseLoaded { repo, days, data } => {
+                if self.pulse.repo.as_ref().map(RepoId::key).as_deref() == Some(&repo)
+                    && self.pulse.days == days
+                {
+                    self.pulse.data = Some(*data);
+                }
+                Task::none()
+            }
+            HubMessage::ContributionsLoaded(c) => {
+                if let Some(e) = c.errors.first() {
+                    self.notice = Some((e.clone(), false));
+                }
+                self.pulse.contributions = Some(c);
+                Task::none()
+            }
+            HubMessage::PickDay(date) => self.pick_day(date),
+            HubMessage::StepDay(n) => {
+                let today = Utc::now().date_naive();
+                let to = if n == 0 {
+                    today
+                } else {
+                    let from = self.pulse.day.unwrap_or(today);
+                    (from + chrono::Duration::days(n)).min(today)
+                };
+                if (today - to).num_days() > 370 {
+                    return Task::none();
+                }
+                self.pick_day(to)
+            }
+            HubMessage::DayLoaded(r) => {
+                if self.pulse.day == Some(r.activity.date) {
+                    if let Some(e) = r.errors.first() {
+                        self.notice = Some((e.clone(), false));
+                    }
+                    self.pulse.day_data = Some(r);
+                }
+                Task::none()
+            }
+            HubMessage::PulseRepo(i) => {
+                if let Some(r) = self.watched.get(i).cloned() {
+                    self.pulse.repo = Some(r);
+                    self.pulse.data = None;
+                    return self.load_pulse(self.pulse.days.max(30));
+                }
+                Task::none()
+            }
+            HubMessage::PulseDays(d) => {
+                self.pulse.data = None;
+                self.load_pulse(d)
+            }
+            HubMessage::ToggleBell => self.toggle_bell(),
+            HubMessage::Tick => self.tick(),
+            HubMessage::Polled => {
+                self.polling = false;
+                self.refresh_bell();
+                Task::none()
+            }
+        }
+    }
+
+    // ── Loading ──────────────────────────────────────────────────────────────
+
+    fn load_all(&mut self) -> Task<HubMessage> {
+        let tasks: Vec<_> = self
+            .visible_sections()
+            .into_iter()
+            .map(|i| self.load_section(i))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    fn load_section(&mut self, idx: usize) -> Task<HubMessage> {
+        let (Some(api), Some(section)) = (self.handle(), self.dashboard.sections.get(idx).cloned())
+        else {
+            return Task::none();
+        };
+        let Some(slot) = self.slots.get_mut(idx) else {
+            return Task::none();
+        };
+        slot.loading = true;
+        slot.generation += 1;
+        let generation = slot.generation;
+        Task::perform(
+            async move { api.load_section(&section).await },
+            move |data| HubMessage::SectionLoaded {
+                idx,
+                generation,
+                data: Arc::new(data),
+            },
+        )
+    }
+
+    fn select_section(&mut self, vis: usize) -> Task<HubMessage> {
+        let n = self.visible_sections().len();
+        if n == 0 {
+            return Task::none();
+        }
+        self.active = vis.min(n - 1);
+        self.row = None;
+        self.log = None;
+        self.detail = Detail::default();
+        let mut tasks = Vec::new();
+        if let Some(idx) = self.active_index() {
+            if self.slots[idx].data.is_none() && !self.slots[idx].loading {
+                tasks.push(self.load_section(idx));
+            } else if self.active_data().is_some_and(|d| !d.is_empty()) {
+                self.row = Some(0);
+                tasks.push(self.on_selection());
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    fn on_selection(&mut self) -> Task<HubMessage> {
+        let (Some(api), Some(row)) = (self.handle(), self.row) else {
+            self.detail = Detail::default();
+            return Task::none();
+        };
+        match self.active_data() {
+            Some(SectionData::Prs(r)) => {
+                let Some(pr) = r.items.get(row).cloned() else {
+                    return Task::none();
+                };
+                let key = format!("{}#{}", pr.repo.key(), pr.number);
+                self.begin_detail(&key);
+                self.tab = PrTab::Overview;
+                let k = key.clone();
+                Task::perform(
+                    async move {
+                        api.pr_detail(&pr.repo, pr.number)
+                            .await
+                            .map(Arc::new)
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| HubMessage::PrLoaded {
+                        key: k.clone(),
+                        result,
+                    },
+                )
+            }
+            Some(SectionData::Issues(r)) => {
+                let Some(issue) = r.items.get(row).cloned() else {
+                    return Task::none();
+                };
+                let key = format!("{}#{}", issue.repo.key(), issue.number);
+                self.begin_detail(&key);
+                let k = key.clone();
+                Task::perform(
+                    async move {
+                        match api.backend(&issue.repo.host) {
+                            Some(b) => b
+                                .comments(&issue.repo, ItemKind::Issue, issue.number)
+                                .await
+                                .map_err(|e| e.to_string()),
+                            None => Err("no account".to_string()),
+                        }
+                    },
+                    move |result| HubMessage::CommentsLoaded {
+                        key: k.clone(),
+                        result,
+                    },
+                )
+            }
+            Some(SectionData::Runs(r)) => {
+                let Some(run) = r.items.get(row).cloned() else {
+                    return Task::none();
+                };
+                let key = format!("{}!{}", run.repo.key(), run.id);
+                self.begin_detail(&key);
+                let k = key.clone();
+                Task::perform(
+                    async move {
+                        match api.ci(&run.repo.host) {
+                            Some(ci) => ci
+                                .run_detail(&run.repo, run.id)
+                                .await
+                                .map(Arc::new)
+                                .map_err(|e| e.to_string()),
+                            None => Err("no account".to_string()),
+                        }
+                    },
+                    move |result| HubMessage::RunLoaded {
+                        key: k.clone(),
+                        result,
+                    },
+                )
+            }
+            _ => {
+                self.detail = Detail::default();
+                Task::none()
+            }
+        }
+    }
+
+    fn begin_detail(&mut self, key: &str) {
+        if self.detail.key.as_deref() != Some(key) {
+            self.detail = Detail {
+                key: Some(key.to_string()),
+                loading: true,
+                ..Detail::default()
+            };
+        }
+    }
+
+    fn open_log(&mut self) -> Task<HubMessage> {
+        let (Some(api), Some(row)) = (self.handle(), self.row) else {
+            return Task::none();
+        };
+        let Some(SectionData::Runs(r)) = self.active_data() else {
+            return Task::none();
+        };
+        let Some(run) = r.items.get(row).cloned() else {
+            return Task::none();
+        };
+        let Some(job) = self
+            .detail
+            .run
+            .as_ref()
+            .and_then(|d| d.jobs.get(self.detail.job))
+            .cloned()
+        else {
+            self.notice = Some(("no job selected yet".into(), false));
+            return Task::none();
+        };
+        let title = format!("{} · {}", run.name, job.name);
+        self.notice = Some((format!("loading log of {}…", job.name), true));
+        Task::perform(
+            async move {
+                match api.ci(&run.repo.host) {
+                    Some(ci) => ci
+                        .job_log(&run.repo, job.id)
+                        .await
+                        .map(|raw| (title, raw))
+                        .map_err(|e| e.to_string()),
+                    None => Err("no account".to_string()),
+                }
+            },
+            HubMessage::LogLoaded,
+        )
+    }
+
+    /// Asks the AI about the selected job when it failed, else the first failed one; the answer
+    /// opens in the log view.
+    fn explain(&mut self) -> Task<HubMessage> {
+        let (Some(api), Some(row)) = (self.handle(), self.row) else {
+            return Task::none();
+        };
+        let Some(SectionData::Runs(r)) = self.active_data() else {
+            return Task::none();
+        };
+        let Some(run) = r.items.get(row).cloned() else {
+            return Task::none();
+        };
+        let Some(detail) = self.detail.run.as_ref() else {
+            self.notice = Some(("open the run first".into(), false));
+            return Task::none();
+        };
+        let wanted = detail.jobs.get(self.detail.job).map(|j| j.id);
+        let Some(job) = gitkraft_hub::ai::failed_job(&detail.jobs, wanted).cloned() else {
+            self.notice = Some(("no failed job to explain".into(), false));
+            return Task::none();
+        };
+        let title = format!("AI · {} · {}", run.name, job.name);
+        self.notice = Some((format!("asking the AI about {}…", job.name), true));
+        Task::perform(
+            async move {
+                let ci = api.ci(&run.repo.host).ok_or("no account")?;
+                let ctx = gitkraft_hub::ai::failure_context(ci, &run, &job).await?;
+                let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                gitkraft_hub::ai::explain_failure(&llm, &ctx)
+                    .await
+                    .map(|text| (title, text))
+                    .map_err(|e| e.to_string())
+            },
+            HubMessage::LogLoaded,
+        )
+    }
+
+    /// An AI draft about the selected pull request, shown in the log view. Refused unless its host
+    /// opted in with `gitkraft-tui ai-allow`; changes nothing.
+    fn ai_pr(&mut self, action: gitkraft_hub::review_ai::Action) -> Task<HubMessage> {
+        // a catch-up starts at the date typed in the box (YYYY-MM-DD); empty is the whole thread
+        let since = if action == gitkraft_hub::review_ai::Action::CatchUp {
+            match gitkraft_hub::review_ai::parse_since(&self.note) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.notice = Some((e, false));
+                    return Task::none();
+                }
+            }
+        } else {
+            None
+        };
+        use gitkraft_hub::review_ai::{self, Action, Policy};
+        let Some(pr) = self.selected_pr() else {
+            self.notice = Some(("select a pull request first".into(), false));
+            return Task::none();
+        };
+        let policy = match &self.ai_dir {
+            Some(d) => Policy::load(d),
+            None => Ok(Policy::default()),
+        };
+        if let Err(e) = policy.and_then(|p| p.check(&pr.repo.host, action)) {
+            self.notice = Some((e, false));
+            return Task::none();
+        }
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        let title = format!("AI {} · #{} {}", action.name(), pr.number, pr.title);
+        self.notice = Some((format!("asking the AI about #{}…", pr.number), true));
+        let draft = async move {
+            {
+                let detail = api
+                    .pr_detail(&pr.repo, pr.number)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                match action {
+                    Action::Summary => review_ai::summarize_pr(&llm, &detail).await,
+                    Action::CatchUp => review_ai::catch_up(&llm, &detail, since).await,
+                    Action::Review => review_ai::review_draft(&llm, &detail)
+                        .await
+                        .map(|n| n.iter().map(|n| format!("{}\n", n.render())).collect()),
+                    Action::Triage | Action::Watch => Ok(String::new()),
+                }
+                .map(|text| (title, text))
+                .map_err(|e| e.to_string())
+            }
+        };
+        // review notes are meant to be edited and posted; the others are read
+        if action == Action::Review {
+            Task::perform(
+                async move { draft.await.map(|(_, text)| text) },
+                HubMessage::ReviewDrafted,
+            )
+        } else {
+            Task::perform(draft, HubMessage::LogLoaded)
+        }
+    }
+
+    /// AI triage of the shown inbox, in the log view. Nothing is marked or changed.
+    fn ai_triage(&mut self) -> Task<HubMessage> {
+        use gitkraft_hub::review_ai::Policy;
+        let Some(SectionData::Inbox(r)) = self.active_data() else {
+            self.notice = Some(("open an inbox section to triage it".into(), false));
+            return Task::none();
+        };
+        let mut items = r.items.clone();
+        items.truncate(30);
+        let policy = match &self.ai_dir {
+            Some(d) => Policy::load(d),
+            None => Ok(Policy::default()),
+        };
+        let policy = match policy {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = Some((e, false));
+                return Task::none();
+            }
+        };
+        let Some(_) = self.handle() else {
+            return Task::none();
+        };
+        self.notice = Some(("asking the AI to triage the inbox…".into(), true));
+        Task::perform(
+            async move {
+                let llm = tokio::task::spawn_blocking(gitkraft_hub::ai::remote_default)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                gitkraft_hub::review_ai::triage_report(&llm, items, &policy)
+                    .await
+                    .map(|text| ("AI triage".to_string(), text))
+            },
+            HubMessage::LogLoaded,
+        )
+    }
+
+    fn pick_day(&mut self, date: NaiveDate) -> Task<HubMessage> {
+        self.pulse.day = Some(date);
+        self.pulse.day_data = None;
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        Task::perform(async move { api.day_activity(date).await }, |r| {
+            HubMessage::DayLoaded(Arc::new(r))
+        })
+    }
+
+    fn load_pulse(&mut self, days: u32) -> Task<HubMessage> {
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        let Some(repo) = self.pulse.repo.clone().or_else(|| self.current_repo()) else {
+            self.notice = Some(("no repository to show a pulse for".into(), false));
+            return Task::none();
+        };
+        self.pulse.repo = Some(repo.clone());
+        self.pulse.days = days;
+        let api2 = api.clone();
+        let key = repo.key();
+        let pulse = Task::perform(
+            async move { api2.repo_pulse(&repo, days).await },
+            move |data| HubMessage::PulseLoaded {
+                repo: key.clone(),
+                days,
+                data: Box::new(data),
+            },
+        );
+        let contributions = Task::perform(async move { api.contributions().await }, |c| {
+            HubMessage::ContributionsLoaded(Arc::new(c))
+        });
+        Task::batch([pulse, contributions])
+    }
+
+    // ── Discussions and wiki ─────────────────────────────────────────────────
+
+    /// Loads the list for the current repository and tab.
+    fn load_community(&mut self) -> Task<HubMessage> {
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        let Some(repo) = self.community.repo.clone().or_else(|| self.current_repo()) else {
+            self.notice = Some(("no repository: add one to a section".into(), false));
+            return Task::none();
+        };
+        let tab = self.community.tab;
+        self.community.repo = Some(repo.clone());
+        self.community.loading = true;
+        self.community.items = None;
+        self.community.page = None;
+        self.community.error = None;
+        let key = repo.key();
+        Task::perform(
+            async move { gitkraft_hub::community::list(&api, &repo, tab).await },
+            move |result| HubMessage::CommunityLoaded {
+                repo: key.clone(),
+                tab,
+                result,
+            },
+        )
+    }
+
+    fn open_community(&mut self, i: usize) -> Task<HubMessage> {
+        self.community.row = i;
+        let (Some(api), Some(repo), Some(item)) = (
+            self.handle(),
+            self.community.repo.clone(),
+            self.community
+                .items
+                .as_ref()
+                .and_then(|l| l.get(i))
+                .cloned(),
+        ) else {
+            return Task::none();
+        };
+        let tab = self.community.tab;
+        let key = repo.key();
+        Task::perform(
+            async move { gitkraft_hub::community::page(&api, &repo, tab, &item).await },
+            move |result| HubMessage::CommunityPageLoaded {
+                repo: key.clone(),
+                tab,
+                result,
+            },
+        )
+    }
+
+    /// Reads the list again without closing the open page.
+    fn load_community_keep_page(&mut self) -> Task<HubMessage> {
+        let page = self.community.page.take();
+        let task = self.load_community();
+        self.community.page = page;
+        task
+    }
+
+    fn new_card(&mut self) -> Task<HubMessage> {
+        let typed = self.note.trim().to_string();
+        let (Some(api), Some(repo)) = (self.handle(), self.community.repo.clone()) else {
+            return Task::none();
+        };
+        if self.community.tab != gitkraft_hub::community::Tab::Board {
+            return Task::none();
+        }
+        let (title, column) = match typed.split_once('|') {
+            Some((t, c)) => (t.trim().to_string(), Some(c.trim().to_string())),
+            None => (typed, None),
+        };
+        let board = self
+            .community
+            .items
+            .as_ref()
+            .and_then(|l| l.get(self.community.row))
+            .map(|i| i.board.clone());
+        self.note.clear();
+        Task::perform(
+            async move {
+                gitkraft_hub::community::new_card(
+                    &api,
+                    &repo,
+                    board.as_deref(),
+                    &title,
+                    column.as_deref(),
+                )
+                .await
+            },
+            HubMessage::CommunityWritten,
+        )
+    }
+
+    fn shift_card(&mut self, shift: gitkraft_hub::community::Shift) -> Task<HubMessage> {
+        let (Some(api), Some(repo), Some(item)) = (
+            self.handle(),
+            self.community.repo.clone(),
+            self.community
+                .items
+                .as_ref()
+                .and_then(|l| l.get(self.community.row))
+                .cloned(),
+        ) else {
+            return Task::none();
+        };
+        if self.community.tab != gitkraft_hub::community::Tab::Board {
+            return Task::none();
+        }
+        let Ok(number) = item.key.parse::<u64>() else {
+            self.notice = Some(("a draft card has no issue to move".into(), false));
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                gitkraft_hub::community::reorder_card(&api, &repo, Some(&item.board), number, shift)
+                    .await
+            },
+            HubMessage::CommunityWritten,
+        )
+    }
+
+    fn mark_answer(&mut self, comment: u64) -> Task<HubMessage> {
+        let (Some(api), Some(repo), Some(number)) = (
+            self.handle(),
+            self.community.repo.clone(),
+            self.community
+                .page
+                .as_ref()
+                .and_then(|p| p.key.parse::<u64>().ok()),
+        ) else {
+            return Task::none();
+        };
+        if self.community.tab != gitkraft_hub::community::Tab::Discussions {
+            return Task::none();
+        }
+        Task::perform(
+            async move { gitkraft_hub::community::mark_answer(&api, &repo, number, comment).await },
+            HubMessage::CommunityWritten,
+        )
+    }
+
+    fn move_card(&mut self) -> Task<HubMessage> {
+        let column = self.note.trim().to_string();
+        let (Some(api), Some(repo), Some(item)) = (
+            self.handle(),
+            self.community.repo.clone(),
+            self.community
+                .items
+                .as_ref()
+                .and_then(|l| l.get(self.community.row))
+                .cloned(),
+        ) else {
+            return Task::none();
+        };
+        if self.community.tab != gitkraft_hub::community::Tab::Board {
+            return Task::none();
+        }
+        let Ok(number) = item.key.parse::<u64>() else {
+            self.notice = Some(("a draft card has no issue to move".into(), false));
+            return Task::none();
+        };
+        self.note.clear();
+        Task::perform(
+            async move {
+                gitkraft_hub::community::move_card(&api, &repo, Some(&item.board), number, &column)
+                    .await
+            },
+            HubMessage::CommunityWritten,
+        )
+    }
+
+    fn start_wiki_edit(&mut self, new_title: Option<String>) {
+        let Some(repo) = self.community.repo.clone() else {
+            return;
+        };
+        if self.community.tab != gitkraft_hub::community::Tab::Wiki {
+            self.notice = Some(("only wiki pages are edited here".into(), false));
+            return;
+        }
+        let draft = match (&new_title, &self.community.page) {
+            (Some(t), _) => gitkraft_hub::community::WikiDraft::write(&repo, None, t, ""),
+            (None, Some(p)) => {
+                gitkraft_hub::community::WikiDraft::write(&repo, Some(&p.key), &p.title, &p.text)
+            }
+            (None, None) => {
+                self.notice = Some(("open a wiki page first".into(), false));
+                return;
+            }
+        };
+        match draft {
+            Ok(d) => {
+                self.notice = Some((
+                    format!("edit {}, save it, then press Upload", d.path.display()),
+                    true,
+                ));
+                self.community.wiki_draft = Some(d);
+                self.community.open_draft = true;
+            }
+            Err(e) => self.notice = Some((e, false)),
+        }
+    }
+
+    /// The file to open in the editor, once, after [`HubMessage::WikiEdit`] or [`HubMessage::WikiNew`].
+    pub fn take_draft_to_open(&mut self) -> Option<PathBuf> {
+        if std::mem::take(&mut self.community.open_draft) {
+            self.community.wiki_draft.as_ref().map(|d| d.path.clone())
+        } else {
+            None
+        }
+    }
+
+    fn upload_wiki(&mut self) -> Task<HubMessage> {
+        let (Some(api), Some(draft)) = (self.handle(), self.community.wiki_draft.clone()) else {
+            self.notice = Some((
+                "no wiki page is being edited: press Edit first".into(),
+                false,
+            ));
+            return Task::none();
+        };
+        Task::perform(
+            async move { gitkraft_hub::community::upload_draft(&api, &draft).await },
+            HubMessage::CommunityWritten,
+        )
+    }
+
+    fn comment_on_discussion(&mut self) -> Task<HubMessage> {
+        let body = self.note.trim().to_string();
+        if self.community.tab != gitkraft_hub::community::Tab::Discussions {
+            self.notice = Some(("wiki pages take no comments".into(), false));
+            return Task::none();
+        }
+        let (Some(api), Some(repo), Some(page)) = (
+            self.handle(),
+            self.community.repo.clone(),
+            self.community.page.clone(),
+        ) else {
+            return Task::none();
+        };
+        let Ok(number) = page.key.parse::<u64>() else {
+            return Task::none();
+        };
+        if body.is_empty() {
+            self.notice = Some(("a comment needs some text".into(), false));
+            return Task::none();
+        }
+        self.note.clear();
+        let reply_to = self.community.reply_to.take().map(|(id, _)| id);
+        let item = gitkraft_hub::community::Item {
+            key: page.key.clone(),
+            title: page.title.clone(),
+            ..Default::default()
+        };
+        let key = repo.key();
+        Task::perform(
+            async move {
+                match reply_to {
+                    Some(id) => {
+                        gitkraft_hub::community::reply(&api, &repo, number, id, &body).await?;
+                    }
+                    None => {
+                        let b = api.backend(&repo.host).ok_or("no account")?;
+                        b.comment_on_discussion(&repo, number, &body)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                // show the page again, now with the new comment
+                gitkraft_hub::community::page(
+                    &api,
+                    &repo,
+                    gitkraft_hub::community::Tab::Discussions,
+                    &item,
+                )
+                .await
+            },
+            move |result| HubMessage::CommunityPageLoaded {
+                repo: key.clone(),
+                tab: gitkraft_hub::community::Tab::Discussions,
+                result,
+            },
+        )
+    }
+
+    // ── SSH keys ─────────────────────────────────────────────────────────────
+
+    /// The selected key row.
+    pub fn selected_key(&self) -> Option<&gitkraft_hub::keys::KeyRow> {
+        self.keys.data.as_ref()?.rows.get(self.keys.row)
+    }
+
+    /// The host to act on: the selected key's, else the first account's.
+    pub fn keys_host(&self) -> Option<String> {
+        self.selected_key()
+            .map(|r| r.host.clone())
+            .or_else(|| self.keys.data.as_ref()?.hosts.first().cloned())
+    }
+
+    fn load_keys(&mut self) -> Task<HubMessage> {
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        self.keys.loading = true;
+        Task::perform(
+            async move {
+                let mine = tokio::task::spawn_blocking(|| {
+                    gitkraft_hub::keys::local_fingerprints(
+                        &ssh_dir(),
+                        &gitkraft_platforms::ssh::SystemSsh,
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                Arc::new(gitkraft_hub::keys::load(&api, &mine).await)
+            },
+            HubMessage::KeysLoaded,
+        )
+    }
+
+    // ── Section order ────────────────────────────────────────────────────────
+
+    /// Moves the section at visible index `from` to `to` and saves the order.
+    pub fn reorder_sections(&mut self, from: usize, to: usize) -> bool {
+        let vis = self.visible_sections();
+        let (Some(&a), Some(&b)) = (vis.get(from), vis.get(to)) else {
+            return false;
+        };
+        if !self.dashboard.reorder(a, b) {
+            return false;
+        }
+        reorder(&mut self.slots, a, b);
+        self.active = to;
+        if let Some(path) = &self.dashboard_file
+            && let Ok(text) = self.dashboard.to_toml()
+        {
+            let _ = files::write_atomic(path, &text);
+        }
+        true
+    }
+
+    // ── Actions ──────────────────────────────────────────────────────────────
+
+    fn target(&self) -> Option<(RepoId, u64, ItemKind, bool)> {
+        let row = self.row?;
+        match self.active_data()? {
+            SectionData::Prs(r) => r.items.get(row).map(|p| {
+                (
+                    p.repo.clone(),
+                    p.number,
+                    ItemKind::PullRequest,
+                    p.state == ItemState::Open,
+                )
+            }),
+            SectionData::Issues(r) => r.items.get(row).map(|i| {
+                (
+                    i.repo.clone(),
+                    i.number,
+                    ItemKind::Issue,
+                    i.state == ItemState::Open,
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    fn act<F, Fut>(&mut self, f: F) -> Task<HubMessage>
+    where
+        F: FnOnce(Arc<Api>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        match self.handle() {
+            Some(api) => Task::perform(f(api), HubMessage::ActionDone),
+            None => Task::none(),
+        }
+    }
+
+    fn post_comment(&mut self) -> Task<HubMessage> {
+        let body = self.note.trim().to_string();
+        let Some((repo, number, kind, _)) = self.target() else {
+            return Task::none();
+        };
+        if body.is_empty() {
+            self.notice = Some(("a comment needs some text".into(), false));
+            return Task::none();
+        }
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.post_comment(&repo, kind, number, &body)
+                .await
+                .map(|()| "comment posted".to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn edit_labels(&mut self) -> Task<HubMessage> {
+        let edit = match gitkraft_hub::labels::parse(&self.note) {
+            Ok(e) => e,
+            Err(e) => {
+                self.notice = Some((e, false));
+                return Task::none();
+            }
+        };
+        let Some((repo, number, kind, _)) = self.target() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.edit_labels(&repo, kind, number, &edit.add, &edit.remove)
+                .await
+                .map(|()| "labels updated".to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn inline_comment(&mut self) -> Task<HubMessage> {
+        let body = self.note.trim().to_string();
+        let Some(pr) = self.selected_pr() else {
+            self.notice = Some(("select a pull request first".into(), false));
+            return Task::none();
+        };
+        let diff = self
+            .detail
+            .pr
+            .as_ref()
+            .map(|d| d.diff.as_str())
+            .unwrap_or_default();
+        let anchor = self.detail.diff_line.and_then(|i| {
+            gitkraft_platforms::diffpos::positions(diff)
+                .get(i)?
+                .anchor()
+        });
+        let Some(anchor) = anchor else {
+            self.notice = Some(("click a changed or unchanged diff line first".into(), false));
+            return Task::none();
+        };
+        if body.is_empty() {
+            self.notice = Some(("a comment needs some text".into(), false));
+            return Task::none();
+        }
+        self.act(move |api| async move {
+            let b = api.backend(&pr.repo.host).ok_or("no account")?;
+            b.comment_on_line(&pr.repo, pr.number, &anchor, &body)
+                .await
+                .map(|()| format!("commented on {}:{}", anchor.path, anchor.line))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn review(&mut self, verdict: ReviewVerdict) -> Task<HubMessage> {
+        let body = self.note.trim().to_string();
+        let Some((repo, number, ItemKind::PullRequest, _)) = self.target() else {
+            self.notice = Some(("reviews only apply to pull requests".into(), false));
+            return Task::none();
+        };
+        if verdict == ReviewVerdict::RequestChanges && body.is_empty() {
+            self.notice = Some(("requesting changes needs a note".into(), false));
+            return Task::none();
+        }
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.submit_review(&repo, number, verdict, &body)
+                .await
+                .map(|()| "review sent".to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn merge(&mut self, method: MergeMethod) -> Task<HubMessage> {
+        let Some((repo, number, ItemKind::PullRequest, _)) = self.target() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.merge(&repo, number, method)
+                .await
+                .map(|()| format!("#{number} merged"))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn merge_with(&mut self, timing: MergeTiming, force: bool) -> Task<HubMessage> {
+        let Some((repo, number, ItemKind::PullRequest, _)) = self.target() else {
+            return Task::none();
+        };
+        let options = MergeOptions {
+            method: self.merge_method,
+            timing,
+            force,
+        };
+        if let Some(problem) = options.problem() {
+            self.notice = Some((problem.into(), false));
+            return Task::none();
+        }
+        if force && !self.force_armed {
+            self.force_armed = true;
+            self.notice = Some((
+                format!("{}: click Force merge again to confirm", options.describe()),
+                false,
+            ));
+            return Task::none();
+        }
+        self.force_armed = false;
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.merge_with(&repo, number, &options)
+                .await
+                .map(|o| o.describe(number))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn update_branch(&mut self) -> Task<HubMessage> {
+        let Some((repo, number, ItemKind::PullRequest, _)) = self.target() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.update_branch(&repo, number, UpdateStyle::Default)
+                .await
+                .map(|()| format!("#{number} is being updated"))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn cancel_auto_merge(&mut self) -> Task<HubMessage> {
+        let Some((repo, number, ItemKind::PullRequest, _)) = self.target() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.cancel_auto_merge(&repo, number)
+                .await
+                .map(|()| format!("#{number} will no longer auto-merge"))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn toggle_open(&mut self) -> Task<HubMessage> {
+        let Some((repo, number, kind, open)) = self.target() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let b = api.backend(&repo.host).ok_or("no account")?;
+            b.set_open(&repo, kind, number, !open)
+                .await
+                .map(|()| format!("#{number} {}", if open { "closed" } else { "reopened" }))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn selected_pr(&self) -> Option<gitkraft_platforms::model::PullRequest> {
+        let SectionData::Prs(r) = self.active_data()? else {
+            return None;
+        };
+        r.items.get(self.row?).cloned()
+    }
+
+    /// Web page of the selected pull request, issue, CI run or notification.
+    pub fn selected_url(&self) -> Option<String> {
+        let row = self.row?;
+        let url = match self.active_data()? {
+            SectionData::Prs(r) => r.items.get(row)?.url.clone(),
+            SectionData::Issues(r) => r.items.get(row)?.url.clone(),
+            SectionData::Runs(r) => r.items.get(row)?.url.clone(),
+            SectionData::Inbox(r) => r.items.get(row)?.url.clone(),
+        };
+        (!url.is_empty()).then_some(url)
+    }
+
+    fn open_in_browser(&mut self) {
+        let Some(url) = self.selected_url() else {
+            self.notice = Some(("nothing to open".into(), false));
+            return;
+        };
+        // Tests must never start a real browser.
+        let opened = if cfg!(test) {
+            gitkraft_hub::browser::is_web_url(&url)
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other(format!("not a web link: {url}")))
+        } else {
+            gitkraft_hub::browser::open(&url)
+        };
+        self.notice = Some(match opened {
+            Ok(()) => (format!("opened {url}"), true),
+            Err(e) => (format!("browser: {e}"), false),
+        });
+    }
+
+    fn selected_run(&self) -> Option<gitkraft_ci::Run> {
+        let SectionData::Runs(r) = self.active_data()? else {
+            return None;
+        };
+        r.items.get(self.row?).cloned()
+    }
+
+    fn rerun(&mut self, scope: RerunScope) -> Task<HubMessage> {
+        let Some(run) = self.selected_run() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let ci = api.ci(&run.repo.host).ok_or("no account")?;
+            ci.rerun(&run.repo, &run, scope)
+                .await
+                .map(|()| "re-run started".to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// What the palette can do now, as `(label, message)`.
+    pub fn palette_entries(&self) -> Vec<(String, HubMessage)> {
+        use gitkraft_platforms::model::MergeMethod;
+        let mut v: Vec<(String, HubMessage)> = Vec::new();
+        let mut add = |l: &str, m: HubMessage| v.push((l.to_string(), m));
+        if matches!(self.active_data(), Some(SectionData::Inbox(_))) {
+            add(
+                "Inbox: AI triage (now / fyi / ignore)",
+                HubMessage::AiTriage,
+            );
+        }
+        if self.selected_url().is_some() {
+            add("Open in the browser", HubMessage::OpenInBrowser);
+        }
+        if self.selected_pr().is_some() {
+            add(
+                "Pull request: approve (note = text box)",
+                HubMessage::Approve,
+            );
+            add("Pull request: request changes", HubMessage::RequestChanges);
+            add("Pull request: comment", HubMessage::PostComment);
+            add(
+                "Pull request: AI summary",
+                HubMessage::AiPr(gitkraft_hub::review_ai::Action::Summary),
+            );
+            add(
+                "Pull request: AI catch-up on the thread",
+                HubMessage::AiPr(gitkraft_hub::review_ai::Action::CatchUp),
+            );
+            add(
+                "Pull request: AI review notes",
+                HubMessage::AiPr(gitkraft_hub::review_ai::Action::Review),
+            );
+            add("Pull request: merge", HubMessage::Merge(MergeMethod::Merge));
+            add(
+                "Pull request: squash and merge",
+                HubMessage::Merge(MergeMethod::Squash),
+            );
+            add(
+                "Pull request: merge when the checks pass",
+                HubMessage::MergeWith(MergeTiming::WhenGreen, false),
+            );
+            add(
+                "Pull request: add to the merge queue",
+                HubMessage::MergeWith(MergeTiming::Queue, false),
+            );
+            add(
+                "Pull request: force merge (admin, asks twice)",
+                HubMessage::MergeWith(MergeTiming::Now, true),
+            );
+            add(
+                "Pull request: cancel auto-merge or leave the queue",
+                HubMessage::CancelAutoMerge,
+            );
+            add("Pull request: update branch", HubMessage::UpdateBranch);
+            add("Pull request: cycle merge method", HubMessage::CycleMethod);
+            add("Pull request: close or reopen", HubMessage::ToggleOpen);
+            add(
+                "Pull request: check out in a worktree",
+                HubMessage::Worktree,
+            );
+            add(
+                "Pull request: change labels (note = +bug -wontfix)",
+                HubMessage::EditLabels,
+            );
+            add("Pull request: show the diff", HubMessage::Tab(PrTab::Diff));
+            if self.tab == PrTab::Diff {
+                add(
+                    "Diff: comment on the selected line (note = text box)",
+                    HubMessage::InlineComment,
+                );
+            }
+        }
+        if self.selected_run().is_some() {
+            add(
+                "CI run: re-run failed jobs",
+                HubMessage::Rerun(RerunScope::Failed),
+            );
+            add(
+                "CI run: re-run everything",
+                HubMessage::Rerun(RerunScope::All),
+            );
+            add("CI run: run the workflow again", HubMessage::Dispatch);
+            add("CI run: download artifacts", HubMessage::Artifacts);
+            add("CI run: explain the failure with AI", HubMessage::Explain);
+            add("CI run: cancel", HubMessage::CancelRun);
+        }
+        for (n, idx) in self.visible_sections().into_iter().enumerate() {
+            let name = &self.dashboard.sections[idx].name;
+            add(
+                &format!("Go to section: {name}"),
+                HubMessage::SelectSection(n),
+            );
+        }
+        add("Go to dashboard", HubMessage::Show(HubView::Dashboard));
+        add("Go to pulse", HubMessage::Show(HubView::Pulse));
+        add("Go to SSH keys", HubMessage::Show(HubView::Keys));
+        add(
+            "Go to agents (scheduled CI watchers)",
+            HubMessage::Show(HubView::Agents),
+        );
+        if self.view == HubView::Agents {
+            use gitkraft_hub::agent_watch::AgentAction as A;
+            if let Some(j) = self.agents.job() {
+                add(
+                    "Agents: run the selected job now",
+                    HubMessage::AgentRun(j.name.clone()),
+                );
+            }
+            add(
+                "Agents: pause or resume the job",
+                HubMessage::Agent(A::ToggleEnabled),
+            );
+            add("Agents: next schedule", HubMessage::Agent(A::NextSchedule));
+            add("Agents: next harness", HubMessage::Agent(A::NextHarness));
+            add(
+                "Agents: next visibility",
+                HubMessage::Agent(A::NextVisibility),
+            );
+            add("Agents: next host filter", HubMessage::Agent(A::NextHost));
+            add(
+                "Agents: watch only the checked repositories",
+                HubMessage::Agent(A::OnlyChecked),
+            );
+            add(
+                "Agents: switch the in-app scheduler",
+                HubMessage::Agent(A::ToggleAuto),
+            );
+        }
+        add(
+            "Go to discussions and wiki",
+            HubMessage::Show(HubView::Community),
+        );
+        add("Refresh", HubMessage::Refresh);
+        if self.project.is_multi() {
+            add(
+                "Remote: show the next forge (all → each → all)",
+                HubMessage::CycleScope,
+            );
+        }
+        add(
+            "Notifications: toggle for this project",
+            HubMessage::ToggleBell,
+        );
+        v
+    }
+
+    /// Entries matching the palette text, best first.
+    pub fn palette_shown(&self) -> Vec<(String, HubMessage)> {
+        let all = self.palette_entries();
+        let q = self.palette.as_deref().unwrap_or_default();
+        gitkraft_hub::fuzzy::filter(all.iter().map(|(l, _)| l.as_str()), q)
+            .into_iter()
+            .filter_map(|i| all.get(i).cloned())
+            .collect()
+    }
+
+    fn palette_run(&mut self, n: usize) -> Task<HubMessage> {
+        let pick = self.palette_shown().into_iter().nth(n);
+        self.palette = None;
+        match pick {
+            Some((_, m)) => self.update(m),
+            None => Task::none(),
+        }
+    }
+
+    fn worktree(&mut self) -> Task<HubMessage> {
+        let Some(pr) = self.selected_pr() else {
+            self.notice = Some(("select a pull request first".into(), false));
+            return Task::none();
+        };
+        let Some(path) = self
+            .checkouts
+            .iter()
+            .find(|(r, _)| *r == pr.repo)
+            .map(|(_, p)| p.clone())
+        else {
+            self.notice = Some((
+                format!(
+                    "no local checkout of {} is open: open it in a tab first",
+                    pr.repo.full_name()
+                ),
+                false,
+            ));
+            return Task::none();
+        };
+        let Some(kind) = self
+            .handle()
+            .and_then(|a| a.backend(&pr.repo.host).map(|b| b.kind()))
+        else {
+            self.notice = Some((format!("{}: no account", pr.repo.host), false));
+            return Task::none();
+        };
+        self.notice = Some((format!("checking out #{}…", pr.number), true));
+        self.act(move |_| async move {
+            tokio::task::spawn_blocking(move || {
+                gitkraft_hub::checkout::checkout_worktree(kind, &pr.repo, pr.number, &path)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        })
+    }
+
+    fn artifacts(&mut self) -> Task<HubMessage> {
+        let Some(run) = self.selected_run() else {
+            self.notice = Some(("select a CI run first".into(), false));
+            return Task::none();
+        };
+        let dir = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("gitkraft-artifacts");
+        self.notice = Some((
+            format!("downloading artifacts of {} #{}…", run.name, run.number),
+            true,
+        ));
+        self.act(move |api| async move {
+            let (saved, skipped) =
+                gitkraft_hub::artifacts::download_all(&api, &run.repo, run.id, &dir).await?;
+            let mut t = format!("saved {} file(s) to {}", saved.len(), dir.display());
+            if !skipped.is_empty() {
+                t.push_str(&format!(" · skipped: {}", skipped.join(", ")));
+            }
+            Ok(t)
+        })
+    }
+
+    fn dispatch(&mut self) -> Task<HubMessage> {
+        let Some(run) = self.selected_run() else {
+            self.notice = Some(("select a CI run first".into(), false));
+            return Task::none();
+        };
+        let needs_workflow = !run.workflow.is_empty();
+        let text = if self.note.trim().is_empty() {
+            if needs_workflow {
+                format!("{} {}", run.workflow, run.branch)
+            } else {
+                run.branch.clone()
+            }
+        } else {
+            self.note.clone()
+        };
+        let d = match gitkraft_hub::dispatch::parse(&text, needs_workflow) {
+            Ok(v) => v,
+            Err(e) => {
+                self.notice = Some((e, false));
+                return Task::none();
+            }
+        };
+        self.act(move |api| async move {
+            let ci = api.ci(&run.repo.host).ok_or("no account")?;
+            gitkraft_hub::dispatch::start(ci, &run.repo, &d).await
+        })
+    }
+
+    fn cancel_run(&mut self) -> Task<HubMessage> {
+        let Some(run) = self.selected_run() else {
+            return Task::none();
+        };
+        self.act(move |api| async move {
+            let ci = api.ci(&run.repo.host).ok_or("no account")?;
+            ci.cancel(&run.repo, run.id)
+                .await
+                .map(|()| "run cancelled".to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    // ── Notifications ────────────────────────────────────────────────────────
+
+    fn toggle_bell(&mut self) -> Task<HubMessage> {
+        let Some(repo) = self.repo_for_bell() else {
+            self.notice = Some(("no repository selected".into(), false));
+            return Task::none();
+        };
+        let key = repo.key();
+        let on = self.notify_config.resolve(&key, None).enabled;
+        let result = (|| {
+            let path = self
+                .notify_file
+                .clone()
+                .ok_or("no config file in this session")?;
+            let text = files::read_optional(&path)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            let edited = set_enabled(&text, Some(&key), !on)?;
+            files::write_atomic(&path, &edited).map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(()) => {
+                self.notify_config = read_config(self.notify_file.as_deref());
+                self.notice = Some((
+                    format!("notifications {} for {key}", if on { "off" } else { "on" }),
+                    true,
+                ));
+                self.refresh_bell();
+            }
+            Err(e) => self.notice = Some((format!("could not change notifications: {e}"), false)),
+        }
+        Task::none()
+    }
+
+    fn refresh_bell(&mut self) {
+        let Some(repo) = self.repo_for_bell() else {
+            self.bell = None;
+            return;
+        };
+        let key = repo.key();
+        let eff = self.notify_config.resolve(&key, None);
+        let Ok(engine) = self.engine.try_lock() else {
+            return;
+        };
+        let st = engine.status.repos.get(&key).cloned().unwrap_or_default();
+        let input = StatusInput {
+            enabled: eff.enabled,
+            muted_until: engine.state.muted_until(&key),
+            last_poll: st.last_poll,
+            last_error: st.last_error,
+            poller_heartbeat: engine.status.heartbeat,
+            interval: eff.poll_interval,
+        };
+        self.bell = Some(Bell {
+            unread: engine.inbox.unread_for(&key),
+            status: status(&input, Utc::now()),
+            key,
+        });
+    }
+
+    /// Fills the model, instructions and globs boxes from the selected job.
+    fn sync_agent_inputs(&mut self) {
+        let job = self.agents.job();
+        self.agent_model = job.and_then(|j| j.model.clone()).unwrap_or_default();
+        self.agent_prompt = job
+            .and_then(|j| j.prompt.as_deref())
+            .map(gitkraft_hub::review_ai::to_one_line)
+            .unwrap_or_default();
+        self.agent_globs = self.agents.globs_text();
+    }
+
+    fn agent_note(&mut self, r: Result<String, String>) {
+        match r {
+            Ok(t) if t.is_empty() => {}
+            Ok(t) => self.notice = Some((t, true)),
+            Err(e) => self.notice = Some((e, false)),
+        }
+    }
+
+    fn load_agent_repos(&mut self) -> Task<HubMessage> {
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        if self.agents.loading_repos {
+            return Task::none();
+        }
+        self.agents.loading_repos = true;
+        Task::perform(
+            async move { Arc::new(gitkraft_hub::agent_watch::scan::universe(&*api).await) },
+            HubMessage::AgentRepos,
+        )
+    }
+
+    /// Runs a job now: scan, agent, report, inbox, system notification. `quiet` is the scheduler
+    /// asking, which does not complain when it cannot start.
+    fn run_agent(&mut self, name: &str, quiet: bool) -> Task<HubMessage> {
+        if let Some(r) = &self.agents.running {
+            if !quiet {
+                self.notice = Some((format!("{r} is still running"), false));
+            }
+            return Task::none();
+        }
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        let (Some(job), Some(store), Some(dir)) = (
+            self.agents.cfg.job(name).cloned(),
+            self.agents.store.clone(),
+            self.agents.dir.clone(),
+        ) else {
+            return Task::none();
+        };
+        self.agents.running = Some(name.to_string());
+        if !quiet {
+            self.notice = Some((format!("running {name}…"), true));
+        }
+        let known = self.agents.repos.clone();
+        let engine = self.engine.clone();
+        Task::perform(
+            async move {
+                let result = match gitkraft_hub::agent_watch::app::run_in_app(
+                    &api, &job, known, &store, &dir,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let mut e = engine.lock().await;
+                        gitkraft_hub::agent_watch::announce(
+                            &out,
+                            &mut e.inbox,
+                            &DesktopNotifier,
+                            Utc::now(),
+                        );
+                        let _ = e.save();
+                        Ok(out.report)
+                    }
+                    Err(e) => Err(e),
+                };
+                (job.name, result)
+            },
+            move |(job, result)| HubMessage::AgentRan { job, quiet, result },
+        )
+    }
+
+    fn tick(&mut self) -> Task<HubMessage> {
+        let scheduled = if self.agents.auto && self.agents.tick_due(std::time::Instant::now()) {
+            self.agents
+                .owed(chrono::Local::now().naive_local())
+                .map(|name| self.run_agent(&name, true))
+        } else {
+            None
+        };
+        let notify = self.tick_notify();
+        match scheduled {
+            Some(t) => Task::batch([t, notify]),
+            None => notify,
+        }
+    }
+
+    fn tick_notify(&mut self) -> Task<HubMessage> {
+        if self.notify_file.is_some() {
+            self.notify_config = read_config(self.notify_file.as_deref());
+        }
+        self.refresh_bell();
+        let Some(api) = self.handle() else {
+            return Task::none();
+        };
+        if self.notify_file.is_none() || self.polling {
+            return Task::none();
+        }
+        self.polling = true;
+        let engine = self.engine.clone();
+        let watched = self.watched.clone();
+        Task::perform(
+            async move {
+                let config = read_config(files::notify_config_path().ok().as_deref());
+                let now = Utc::now();
+                let mut e = engine.lock().await;
+                if e.status.mode.is_empty() {
+                    *e = Engine::load();
+                    e.status.mode = "in-app".into();
+                }
+                let notifier = DesktopNotifier;
+                let report = run_cycle(
+                    &api,
+                    &mut e,
+                    &watched,
+                    &config,
+                    &BTreeMap::<String, NotifySettings>::new(),
+                    now,
+                    chrono::Local::now().time(),
+                    &notifier as &dyn Notifier,
+                )
+                .await;
+                if report.polled > 0 || report.alerts > 0 {
+                    let _ = e.save();
+                }
+            },
+            |()| HubMessage::Polled,
+        )
+    }
+}
+
+/// Scrolls the log so line `i` is in view, and tells the drawing where it went (the scroll area
+/// reports back only on the next event).
+fn scroll_log<M: Send + 'static>(l: &mut LogState, i: usize) -> Task<M> {
+    let y = (i as f32 * LOG_LINE_H - l.view_h / 2.0).max(0.0);
+    l.scroll_y = y;
+    iced::widget::operation::scroll_to(
+        iced::widget::Id::new(LOG_SCROLL),
+        iced::widget::scrollable::AbsoluteOffset {
+            x: None,
+            y: Some(y),
+        },
+    )
+}
+
+fn ssh_dir() -> PathBuf {
+    gitkraft_hub::keys::ssh_dir()
+}
+
+fn machine_name() -> String {
+    gitkraft_hub::keys::machine_name()
+}
+
+fn read_config(path: Option<&std::path::Path>) -> NotifyConfig {
+    path.and_then(|p| files::read_optional(p).ok().flatten())
+        .and_then(|t| NotifyConfig::parse(&t).ok())
+        .unwrap_or_default()
+}
+
+async fn setup(repos: Vec<Vec<String>>, sections: Vec<String>) -> Result<Setup, String> {
+    let built = tokio::task::spawn_blocking(move || {
+        let file = files::accounts_path()
+            .ok()
+            .and_then(|p| files::read_optional(&p).ok().flatten())
+            .map(|t| AccountsFile::parse(&t))
+            .transpose()
+            .map_err(|e| format!("accounts.toml: {e}"))?
+            .unwrap_or_default();
+        let urls: Vec<String> = repos.iter().flatten().cloned().collect();
+        let accounts = discover(&urls, &file, gitkraft_platforms::auth::resolve_token);
+        let mut watched: Vec<RepoId> = Vec::new();
+        for url in &urls {
+            if let Some(r) = gitkraft_platforms::parse_remote_url(url)
+                && !watched.contains(&r)
+            {
+                watched.push(r);
+            }
+        }
+        for key in &sections {
+            if let Some(r) = RepoId::from_key(key)
+                && !watched.contains(&r)
+            {
+                watched.push(r);
+            }
+        }
+        Ok::<_, String>((accounts, watched))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let (accounts, watched) = built;
+    let client: Client = Arc::new(CachedClient::new(
+        ReqwestClient::new().map_err(|e| e.to_string())?,
+    ));
+    let count = accounts.len();
+    Ok(Setup {
+        api: ApiHandle(Arc::new(
+            Hub::new(accounts, &client).with_wiki_git(gitkraft_hub::wiki_git::WikiGit::system()),
+        )),
+        watched,
+        accounts: count,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitkraft_platforms::model::{PullRequest, User};
+    use gitkraft_settings::dashboard::{Involvement, Section, SectionKind, SectionState};
+
+    fn section(name: &str, kind: SectionKind, hidden: bool) -> Section {
+        Section {
+            name: name.into(),
+            kind,
+            repos: if kind == SectionKind::Ci {
+                vec!["github.com/o/r".into()]
+            } else {
+                vec![]
+            },
+            involvement: Some(Involvement::Authored),
+            state: SectionState::Open,
+            label: None,
+            branch: None,
+            hidden,
+        }
+    }
+
+    fn state() -> HubState {
+        let mut s = HubState::detached(Dashboard {
+            sections: vec![
+                section("Mine", SectionKind::Prs, false),
+                section("Issues", SectionKind::Issues, false),
+                section("CI", SectionKind::Ci, false),
+            ],
+        });
+        s.ready = true;
+        let pr = |n| PullRequest {
+            repo: RepoId::new("github.com", "o", "r"),
+            number: n,
+            title: format!("pr {n}"),
+            author: User {
+                login: "a".into(),
+                avatar_url: None,
+            },
+            ..PullRequest::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr(1), pr(2), pr(3)],
+            errors: vec![],
+        })));
+        s
+    }
+
+    #[test]
+    fn dragging_a_tab_onto_another_moves_the_section_and_its_data() {
+        let mut s = state();
+        let _ = s.update(HubMessage::DragStart(0));
+        let _ = s.update(HubMessage::DragEnter(2));
+        assert_eq!(s.drag, Some((0, 2)));
+        let _ = s.update(HubMessage::DragDrop(2));
+        assert_eq!(
+            s.dashboard
+                .sections
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Issues", "CI", "Mine"]
+        );
+        assert_eq!(s.active, 2);
+        assert!(matches!(
+            s.slots[2].data.as_deref(),
+            Some(SectionData::Prs(_))
+        ));
+        assert!(s.drag.is_none());
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t == "section moved" && *ok)
+        );
+    }
+
+    #[test]
+    fn releasing_on_the_same_tab_is_a_click_and_elsewhere_cancels() {
+        let mut s = state();
+        let _ = s.update(HubMessage::DragStart(1));
+        let _ = s.update(HubMessage::DragDrop(1));
+        assert_eq!(s.active, 1);
+        assert_eq!(s.dashboard.sections[0].name, "Mine");
+        let _ = s.update(HubMessage::DragStart(0));
+        let _ = s.update(HubMessage::DragCancel);
+        assert!(s.drag.is_none());
+        let _ = s.update(HubMessage::DragDrop(2));
+        assert_eq!(
+            s.dashboard.sections[0].name, "Mine",
+            "a drop without a drag does nothing"
+        );
+    }
+
+    #[test]
+    fn reordering_respects_hidden_sections_and_saves_when_a_file_is_set() {
+        let mut s = state();
+        s.dashboard.sections[1].hidden = true;
+        let dir = tempfile::tempdir().expect("tmp");
+        s.dashboard_file = Some(dir.path().join("dashboard.toml"));
+        assert!(s.reorder_sections(0, 1));
+        assert_eq!(
+            s.dashboard
+                .sections
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Issues", "CI", "Mine"]
+        );
+        let saved = Dashboard::parse(
+            &std::fs::read_to_string(dir.path().join("dashboard.toml")).expect("saved"),
+        )
+        .expect("valid");
+        assert_eq!(saved, s.dashboard);
+        assert!(!s.reorder_sections(5, 0));
+    }
+
+    #[test]
+    fn the_remote_switcher_cycles_forges_and_filters_loaded_and_arriving_rows() {
+        let mut s = state();
+        assert_eq!(s.scope_text(), "");
+        let _ = s.update(HubMessage::CycleScope);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| !ok && t.contains("single forge"))
+        );
+        s.project = gitkraft_hub::project::Project::from_remotes(&[
+            ("origin".to_string(), "git@github.com:o/r.git".to_string()),
+            (
+                "codeberg".to_string(),
+                "ssh://git@codeberg.org/o/r.git".to_string(),
+            ),
+        ]);
+        s.sync = vec![gitkraft_hub::project::RemoteSync {
+            remote: "codeberg".into(),
+            repo: gitkraft_platforms::RepoId::new("codeberg.org", "o", "r"),
+            state: gitkraft_hub::project::SyncState::Behind(1),
+        }];
+        assert_eq!(s.scope_text(), "⎇ all remotes  origin  codeberg ↓1");
+        let before = s.active_data().map_or(0, SectionData::len);
+        assert!(before > 0);
+        let _ = s.update(HubMessage::CycleScope); // origin = github: the fixture rows stay
+        assert_eq!(s.active_data().map(SectionData::len), Some(before));
+        let _ = s.update(HubMessage::CycleScope); // codeberg: they go
+        assert_eq!(s.active_data().map(SectionData::len), Some(0));
+        s.slots[0].generation = 9;
+        let data = Arc::new(SectionData::Prs(SectionResult {
+            items: vec![PullRequest {
+                repo: gitkraft_platforms::RepoId::new("github.com", "o", "r"),
+                ..PullRequest::default()
+            }],
+            errors: vec![],
+        }));
+        let _ = s.update(HubMessage::SectionLoaded {
+            idx: 0,
+            generation: 9,
+            data,
+        });
+        assert_eq!(
+            s.active_data().map(SectionData::len),
+            Some(0),
+            "late rows are filtered too"
+        );
+        let _ = s.update(HubMessage::CycleScope);
+        assert_eq!(s.scope, gitkraft_hub::project::Scope::All);
+    }
+
+    #[test]
+    fn selecting_rows_sections_and_stale_loads() {
+        let mut s = state();
+        let _ = s.update(HubMessage::SelectRow(1));
+        assert_eq!(s.row, Some(1));
+        assert_eq!(
+            s.current_repo().map(|r| r.key()),
+            Some("github.com/o/r".into())
+        );
+        let _ = s.update(HubMessage::SelectSection(0));
+        assert_eq!(
+            s.row,
+            Some(0),
+            "the first row is selected when the section has data"
+        );
+        s.slots[0].generation = 3;
+        let empty = Arc::new(SectionData::Prs(SectionResult {
+            items: vec![],
+            errors: vec![],
+        }));
+        let _ = s.update(HubMessage::SectionLoaded {
+            idx: 0,
+            generation: 2,
+            data: empty.clone(),
+        });
+        assert_eq!(
+            s.active_data().map(SectionData::len),
+            Some(3),
+            "stale load ignored"
+        );
+        let _ = s.update(HubMessage::SectionLoaded {
+            idx: 0,
+            generation: 3,
+            data: empty,
+        });
+        assert_eq!(s.active_data().map(SectionData::len), Some(0));
+        assert_eq!(s.row, None);
+    }
+
+    #[test]
+    fn a_catch_up_reads_its_start_date_from_the_box() {
+        use gitkraft_hub::review_ai::Action;
+        let mut s = state();
+        s.note = "soon".into();
+        let _ = s.update(HubMessage::AiPr(Action::CatchUp));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("YYYY-MM-DD") && !ok),
+            "{:?}",
+            s.notice
+        );
+    }
+
+    #[test]
+    fn triage_wants_an_inbox_section() {
+        let mut s = state();
+        let _ = s.update(HubMessage::AiTriage);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("open an inbox") && !ok),
+            "{:?}",
+            s.notice
+        );
+    }
+
+    #[test]
+    fn ai_drafts_need_a_pull_request_and_the_hosts_opt_in() {
+        use gitkraft_hub::review_ai::Action;
+        let mut s = state();
+        s.ai_dir = None;
+        let _ = s.update(HubMessage::AiPr(Action::Summary));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("select a pull request") && !ok)
+        );
+        let _ = s.update(HubMessage::SelectRow(0));
+        let _ = s.update(HubMessage::AiPr(Action::Review));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("ai-allow github.com review") && !ok),
+            "{:?}",
+            s.notice
+        );
+    }
+
+    #[test]
+    fn actions_without_a_selection_or_input_explain_themselves() {
+        let mut s = state();
+        let _ = s.update(HubMessage::PostComment);
+        assert!(s.notice.is_none(), "no row selected: nothing to say yet");
+        let _ = s.update(HubMessage::SelectRow(0));
+        let _ = s.update(HubMessage::NoteInput("  ".into()));
+        let _ = s.update(HubMessage::PostComment);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("needs some text") && !ok)
+        );
+        let _ = s.update(HubMessage::RequestChanges);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("needs a note"))
+        );
+        let _ = s.update(HubMessage::SelectSection(1));
+        let _ = s.update(HubMessage::Approve);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("only apply to pull requests"))
+        );
+    }
+
+    #[test]
+    fn a_log_arrives_parsed_with_its_first_failure_focused() {
+        let mut s = state();
+        let _ = s.update(HubMessage::LogLoaded(Ok((
+            "CI · build".into(),
+            "ok\nerror[E0425]: no x\n --> src/a.rs:1:2".into(),
+        ))));
+        let log = s.log.as_ref().expect("log");
+        assert_eq!(
+            (log.lines.len(), log.annotations.len(), log.focus),
+            (3, 1, Some(1))
+        );
+        let _ = s.update(HubMessage::JumpLog(2));
+        assert_eq!(s.log.as_ref().and_then(|l| l.focus), Some(2));
+        let _ = s.update(HubMessage::CloseLog);
+        assert!(s.log.is_none());
+        let _ = s.update(HubMessage::LogLoaded(Err("403".into())));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("log: 403") && !ok)
+        );
+    }
+
+    #[test]
+    fn messages_for_a_different_item_are_ignored() {
+        let mut s = state();
+        s.detail.key = Some("a#1".into());
+        s.detail.loading = true;
+        let _ = s.update(HubMessage::CommentsLoaded {
+            key: "a#2".into(),
+            result: Err("late".into()),
+        });
+        assert!(s.detail.loading && s.detail.error.is_none());
+        let _ = s.update(HubMessage::CommentsLoaded {
+            key: "a#1".into(),
+            result: Err("real".into()),
+        });
+        assert_eq!(s.detail.error.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn a_long_log_draws_only_the_lines_in_view_and_a_jump_scrolls_to_them() {
+        let text: String = (0..50_000).map(|i| format!("line {i}\n")).collect();
+        let mut s = state();
+        let _ = s.update(HubMessage::LogLoaded(Ok(("job".into(), text))));
+        let l = s.log.as_ref().expect("log");
+        assert_eq!(l.lines.len(), 50_000);
+        assert!(l.window().len() < 200, "{:?}", l.window());
+        let _ = s.update(HubMessage::LogScrolled(16.0 * 30_000.0, 800.0));
+        let w = s.log.as_ref().expect("log").window();
+        assert!(w.contains(&30_000) && w.len() < 200, "{w:?}");
+        let _ = s.update(HubMessage::JumpLog(10));
+        assert!(s.log.as_ref().expect("log").window().contains(&10));
+    }
+
+    #[test]
+    fn log_search_steps_through_matches_and_wraps() {
+        let mut l = LogState {
+            title: String::new(),
+            lines: Vec::new(),
+            annotations: Vec::new(),
+            focus: None,
+            query: String::new(),
+            matches: vec![2, 5, 9],
+            scroll_y: 0.0,
+            view_h: 100.0,
+        };
+        assert_eq!(l.step(true), Some(2));
+        assert_eq!(l.step(true), Some(5));
+        assert_eq!(l.step(false), Some(2));
+        assert_eq!(l.step(false), Some(9));
+        assert_eq!(l.step(true), Some(2));
+        l.matches.clear();
+        assert_eq!(l.step(true), None);
+    }
+
+    #[test]
+    fn a_finished_poll_lets_the_next_tick_start_one() {
+        let mut s = state();
+        s.polling = true;
+        let _ = s.update(HubMessage::Polled);
+        assert!(!s.polling);
+    }
+
+    #[test]
+    fn the_bell_follows_the_selected_repo_and_the_config() {
+        let mut s = state();
+        let _ = s.update(HubMessage::SelectRow(0));
+        s.refresh_bell();
+        assert!(matches!(
+            s.bell.as_ref().map(|b| &b.status),
+            Some(NotifyStatus::Off)
+        ));
+        s.notify_config = NotifyConfig::parse("[defaults]\nenabled = true\n").expect("valid");
+        s.refresh_bell();
+        assert!(matches!(
+            s.bell.as_ref().map(|b| &b.status),
+            Some(NotifyStatus::NoPoller)
+        ));
+    }
+
+    #[test]
+    fn toggling_the_bell_edits_the_config_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("notifications.toml");
+        let mut s = state();
+        s.notify_file = Some(path.clone());
+        let _ = s.update(HubMessage::SelectRow(0));
+        let _ = s.update(HubMessage::ToggleBell);
+        assert!(s.notify_config.resolve("github.com/o/r", None).enabled);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("written")
+                .contains("enabled = true")
+        );
+        let _ = s.update(HubMessage::ToggleBell);
+        assert!(!s.notify_config.resolve("github.com/o/r", None).enabled);
+        let mut detached = state();
+        let _ = detached.update(HubMessage::SelectRow(0));
+        let _ = detached.update(HubMessage::ToggleBell);
+        assert!(
+            detached
+                .notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("no config file") && !ok)
+        );
+    }
+
+    #[test]
+    fn setup_results_fill_the_state_or_explain() {
+        let mut s = state();
+        s.ready = false;
+        let _ = s.update(HubMessage::Ready(Err("accounts.toml: bad".into())));
+        assert!(
+            s.ready
+                && s.notice
+                    .as_ref()
+                    .is_some_and(|(t, ok)| t.contains("accounts.toml") && !ok)
+        );
+    }
+
+    fn key_rows() -> Arc<gitkraft_hub::keys::KeysData> {
+        use gitkraft_hub::keys::{KeyRow, KeysData};
+        use gitkraft_platforms::model::SshKey;
+        let row = |host: &str, id: &str, mine| KeyRow {
+            host: host.into(),
+            key: SshKey {
+                id: id.into(),
+                title: format!("t{id}"),
+                key: String::new(),
+                fingerprint: None,
+                created_at: None,
+            },
+            mine,
+        };
+        Arc::new(KeysData {
+            hosts: vec!["github.com".into(), "gitlab.com".into()],
+            rows: vec![row("github.com", "1", true), row("gitlab.com", "2", false)],
+            errors: vec!["codeberg.org: 403".into()],
+        })
+    }
+
+    #[test]
+    fn the_agents_view_adds_configures_and_runs_jobs_from_messages() {
+        use gitkraft_hub::agent_watch::{AgentAction as A, AgentsState, Flag};
+        use gitkraft_platforms::RepoId;
+        use gitkraft_platforms::model::RepoInfo;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut s = state();
+        s.agents = AgentsState::in_dirs(tmp.path().join("c"), tmp.path().join("r"));
+        let _ = s.update(HubMessage::Show(HubView::Agents));
+        assert_eq!(s.view, HubView::Agents);
+        let _ = s.update(HubMessage::AgentRepos(Arc::new((
+            vec![RepoInfo {
+                repo: RepoId::new("github.com", "me", "x"),
+                ..RepoInfo::default()
+            }],
+            vec!["codeberg.org: 403".into()],
+        ))));
+        assert_eq!(s.agents.repo_errors, ["codeberg.org: 403"]);
+        let _ = s.update(HubMessage::AgentAdd);
+        assert!(s.notice.as_ref().is_some_and(|(_, ok)| !ok));
+        let _ = s.update(HubMessage::AgentName("oss".into()));
+        let _ = s.update(HubMessage::AgentAdd);
+        assert!(s.agent_name.is_empty());
+        assert_eq!(s.agents.job().map(|j| j.name.as_str()), Some("oss"));
+        let _ = s.update(HubMessage::Agent(A::CheckRepo(0)));
+        assert_eq!(
+            s.agents.job().expect("job").projects.exclude,
+            ["github.com/me/x"]
+        );
+        let _ = s.update(HubMessage::Agent(A::Flip(Flag::Inbox)));
+        assert!(!s.agents.job().expect("job").notify.inbox);
+        let _ = s.update(HubMessage::AgentModelInput("m1".into()));
+        let _ = s.update(HubMessage::AgentSetModel);
+        assert_eq!(s.agents.job().expect("job").model.as_deref(), Some("m1"));
+        // no account behind the fake hub: running does nothing and leaves nothing "running"
+        let _ = s.update(HubMessage::AgentRun("oss".into()));
+        assert!(s.agents.running.is_none());
+        let _ = s.update(HubMessage::AgentRan {
+            job: "oss".into(),
+            quiet: false,
+            result: Err("boom".into()),
+        });
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| !ok && t.contains("boom"))
+        );
+        assert!(
+            s.palette_entries()
+                .iter()
+                .any(|(l, _)| l.contains("agents"))
+        );
+        // deleting takes two steps, and any other change cancels the first
+        let _ = s.update(HubMessage::AgentAskDelete(true));
+        assert!(s.agents.job().is_some(), "job");
+        assert!(s.agent_confirm_delete, "flag");
+        let _ = s.update(HubMessage::Agent(
+            gitkraft_hub::agent_watch::AgentAction::NextSchedule,
+        ));
+        assert!(!s.agent_confirm_delete);
+        let _ = s.update(HubMessage::AgentAskDelete(true));
+        let _ = s.update(HubMessage::Agent(
+            gitkraft_hub::agent_watch::AgentAction::DeleteJob,
+        ));
+        assert!(s.agents.job().is_none() && !s.agent_confirm_delete);
+    }
+
+    #[test]
+    fn keys_arrive_select_and_ask_before_removal() {
+        let mut s = state();
+        let _ = s.update(HubMessage::AskRevoke);
+        assert!(
+            !s.keys.confirm_revoke
+                && s.notice
+                    .as_ref()
+                    .is_some_and(|(t, ok)| t.contains("select a key") && !ok)
+        );
+        s.keys.loading = true;
+        let _ = s.update(HubMessage::KeysLoaded(key_rows()));
+        assert!(!s.keys.loading);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t == "codeberg.org: 403" && !ok)
+        );
+        let _ = s.update(HubMessage::SelectKey(1));
+        assert_eq!(s.keys_host().as_deref(), Some("gitlab.com"));
+        let _ = s.update(HubMessage::AskRevoke);
+        assert!(s.keys.confirm_revoke);
+        let _ = s.update(HubMessage::SelectKey(0));
+        assert!(!s.keys.confirm_revoke, "moving away cancels the question");
+        let _ = s.update(HubMessage::AskRevoke);
+        let _ = s.update(HubMessage::CancelRevoke);
+        assert!(!s.keys.confirm_revoke);
+        let _ = s.update(HubMessage::ConfirmRevoke);
+        assert!(!s.keys.confirm_revoke);
+    }
+
+    #[test]
+    fn a_shorter_key_list_keeps_the_selection_in_range_and_results_show_as_notices() {
+        let mut s = state();
+        s.keys.row = 9;
+        let _ = s.update(HubMessage::KeysLoaded(key_rows()));
+        assert_eq!(s.keys.row, 1);
+        let _ = s.update(HubMessage::KeysActionDone(Ok(
+            "removed key 2 from gitlab.com".into(),
+        )));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.starts_with("removed") && *ok)
+        );
+        let _ = s.update(HubMessage::KeysActionDone(Err("403".into())));
+        assert!(s.notice.as_ref().is_some_and(|(t, ok)| t == "403" && !ok));
+        let _ = s.update(HubMessage::SetupKeys("github.com".into()));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("no account") && !ok)
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_filters_runs_and_closes() {
+        let mut s = state();
+        assert!(s.palette.is_none());
+        let _ = s.update(HubMessage::PaletteToggle);
+        assert_eq!(s.palette.as_deref(), Some(""));
+        let all = s.palette_shown().len();
+        assert!(all >= 6, "views, refresh and bell are always there");
+        let _ = s.update(HubMessage::PaletteQuery("pulse".into()));
+        let shown = s.palette_shown();
+        assert!(!shown.is_empty() && shown.len() < all);
+        assert_eq!(shown[0].0, "Go to pulse");
+        let _ = s.update(HubMessage::PaletteSubmit);
+        assert!(s.palette.is_none(), "running closes it");
+        assert_eq!(s.view, HubView::Pulse);
+        let _ = s.update(HubMessage::PaletteToggle);
+        let _ = s.update(HubMessage::PaletteQuery("zzzz".into()));
+        assert!(s.palette_shown().is_empty());
+        let _ = s.update(HubMessage::PaletteSubmit);
+        assert!(
+            s.palette.is_none() && s.view == HubView::Pulse,
+            "no match: nothing runs"
+        );
+        let _ = s.update(HubMessage::PaletteToggle);
+        let _ = s.update(HubMessage::PaletteToggle);
+        assert!(s.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_offers_pr_and_run_actions_only_when_selected() {
+        let mut s = state();
+        let labels = |s: &HubState| {
+            s.palette_entries()
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect::<Vec<_>>()
+        };
+        assert!(!labels(&s).iter().any(|l| l.starts_with("Pull request:")));
+        let pr = gitkraft_platforms::model::PullRequest {
+            repo: RepoId::new("github.com", "o", "r"),
+            ..Default::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr],
+            errors: vec![],
+        })));
+        let _ = s.update(HubMessage::SelectSection(0));
+        let _ = s.update(HubMessage::SelectRow(0));
+        assert!(
+            labels(&s)
+                .iter()
+                .any(|l| l == "Pull request: check out in a worktree")
+        );
+        assert!(!labels(&s).iter().any(|l| l.starts_with("CI run:")));
+    }
+
+    fn with_pr(s: &mut HubState) {
+        let pr = gitkraft_platforms::model::PullRequest {
+            repo: RepoId::new("github.com", "o", "r"),
+            ..Default::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr],
+            errors: vec![],
+        })));
+        let _ = s.update(HubMessage::SelectSection(0));
+        let _ = s.update(HubMessage::SelectRow(0));
+    }
+
+    #[test]
+    fn a_forced_merge_needs_two_clicks_and_anything_else_disarms_it() {
+        let mut s = state();
+        with_pr(&mut s);
+        let _ = s.update(HubMessage::MergeWith(MergeTiming::Now, true));
+        assert!(s.force_armed);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("FORCE") && t.contains("again"))
+        );
+        // another action in between cancels the arming
+        let _ = s.update(HubMessage::CycleMethod);
+        assert!(!s.force_armed);
+        assert_eq!(s.merge_method, MergeMethod::Squash);
+        let _ = s.update(HubMessage::MergeWith(MergeTiming::Now, true));
+        assert!(s.force_armed);
+        // the second click fires (no API in a test, so nothing is sent) and disarms
+        let _ = s.update(HubMessage::MergeWith(MergeTiming::Now, true));
+        assert!(!s.force_armed);
+        // the ordinary variants never arm
+        let _ = s.update(HubMessage::MergeWith(MergeTiming::Queue, false));
+        assert!(!s.force_armed);
+    }
+
+    #[test]
+    fn the_palette_lists_the_merge_family() {
+        let mut s = state();
+        with_pr(&mut s);
+        let labels: Vec<String> = s.palette_entries().into_iter().map(|(l, _)| l).collect();
+        for want in [
+            "merge queue",
+            "checks pass",
+            "force merge",
+            "update branch",
+            "leave the queue",
+        ] {
+            assert!(
+                labels.iter().any(|l| l.contains(want)),
+                "{want}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_need_text_that_parses() {
+        let mut s = state();
+        let _ = s.update(HubMessage::EditLabels);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("type labels") && !ok)
+        );
+    }
+
+    #[test]
+    fn only_the_diff_lines_in_view_are_drawn_and_a_tab_switch_starts_at_the_top() {
+        assert_eq!(line_window(0.0, 0.0, 10), 0..10, "short diffs draw whole");
+        let w = line_window(0.0, 0.0, 100_000);
+        assert!(
+            w.start == 0 && w.len() < 200,
+            "{w:?}: one screenful before a scroll report"
+        );
+        let w = line_window(LOG_LINE_H * 50_000.0, 800.0, 100_000);
+        assert!(w.contains(&50_000) && w.len() < 200, "{w:?}");
+        assert_eq!(
+            line_window(LOG_LINE_H * 1e9, 800.0, 10),
+            10..10,
+            "past the end is empty"
+        );
+
+        let mut s = state();
+        let _ = s.update(HubMessage::DiffScrolled(LOG_LINE_H * 300.0, 640.0));
+        assert!(s.detail.diff_window(10_000).contains(&300));
+        let _ = s.update(HubMessage::Tab(PrTab::Overview));
+        let _ = s.update(HubMessage::Tab(PrTab::Diff));
+        assert_eq!(s.detail.diff_window(10_000).start, 0);
+    }
+
+    #[test]
+    fn an_inline_comment_needs_a_line_with_an_anchor_and_text() {
+        let mut s = state();
+        let pr = gitkraft_platforms::model::PullRequest {
+            repo: RepoId::new("github.com", "o", "r"),
+            ..Default::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr.clone()],
+            errors: vec![],
+        })));
+        let _ = s.update(HubMessage::SelectSection(0));
+        let _ = s.update(HubMessage::SelectRow(0));
+        s.detail.pr = Some(Arc::new(gitkraft_hub::PrDetail {
+            pr,
+            comments: vec![],
+            reviews: vec![],
+            diff: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +5 @@\n-old\n+new".into(),
+            errors: vec![],
+        }));
+        let say = |s: &HubState| s.notice.clone().map(|(t, _)| t).unwrap_or_default();
+        let _ = s.update(HubMessage::InlineComment);
+        assert!(say(&s).contains("click a changed"), "{}", say(&s));
+        let _ = s.update(HubMessage::DiffLine(0));
+        let _ = s.update(HubMessage::InlineComment);
+        assert!(
+            say(&s).contains("click a changed"),
+            "a header has no anchor"
+        );
+        let _ = s.update(HubMessage::DiffLine(4));
+        let _ = s.update(HubMessage::InlineComment);
+        assert!(say(&s).contains("needs some text"), "{}", say(&s));
+        let _ = s.update(HubMessage::NoteInput("why?".into()));
+        s.notice = None;
+        let _ = s.update(HubMessage::InlineComment);
+        assert!(
+            s.notice.is_none(),
+            "valid input starts the call without a complaint"
+        );
+    }
+
+    #[test]
+    fn open_in_browser_needs_a_selected_web_link() {
+        let mut s = state();
+        let _ = s.update(HubMessage::OpenInBrowser);
+        assert_eq!(
+            s.notice.as_ref().map(|(t, ok)| (t.as_str(), *ok)),
+            Some(("nothing to open", false))
+        );
+        assert!(
+            !s.palette_entries()
+                .iter()
+                .any(|(l, _)| l == "Open in the browser")
+        );
+        let repo = RepoId::new("github.com", "o", "r");
+        let pr = gitkraft_platforms::model::PullRequest {
+            number: 4,
+            repo,
+            url: "https://github.com/o/r/pull/4".into(),
+            ..Default::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr],
+            errors: vec![],
+        })));
+        s.row = Some(0);
+        assert!(
+            s.palette_entries()
+                .iter()
+                .any(|(l, _)| l == "Open in the browser")
+        );
+        let _ = s.update(HubMessage::OpenInBrowser);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t == "opened https://github.com/o/r/pull/4" && *ok)
+        );
+    }
+
+    #[test]
+    fn worktree_needs_a_pull_request_and_an_open_checkout() {
+        let mut s = state();
+        let _ = s.update(HubMessage::Worktree);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("select a pull request") && !ok)
+        );
+        let repo = RepoId::new("github.com", "o", "r");
+        let pr = gitkraft_platforms::model::PullRequest {
+            number: 4,
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        s.slots[0].data = Some(Arc::new(SectionData::Prs(SectionResult {
+            items: vec![pr],
+            errors: vec![],
+        })));
+        let _ = s.update(HubMessage::SelectSection(0));
+        let _ = s.update(HubMessage::SelectRow(0));
+        let _ = s.update(HubMessage::Worktree);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("no local checkout of o/r") && !ok),
+            "{:?}",
+            s.notice
+        );
+        s.checkouts = vec![(repo, std::path::PathBuf::from("/nowhere"))];
+        let _ = s.update(HubMessage::Worktree);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("no account") && !ok),
+            "an unknown host is reported before any git runs"
+        );
+    }
+
+    #[test]
+    fn dispatch_without_a_run_or_with_bad_text_explains() {
+        let mut s = state();
+        let _ = s.update(HubMessage::Dispatch);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("select a CI run") && !ok)
+        );
+        let run = gitkraft_ci::Run {
+            id: 1,
+            workflow: "ci.yml".into(),
+            branch: "main".into(),
+            ..Default::default()
+        };
+        s.slots[2].data = Some(Arc::new(SectionData::Runs(SectionResult {
+            items: vec![run],
+            errors: vec![],
+        })));
+        let _ = s.update(HubMessage::SelectSection(2));
+        let _ = s.update(HubMessage::SelectRow(0));
+        let _ = s.update(HubMessage::NoteInput("ci.yml".into()));
+        let _ = s.update(HubMessage::Dispatch);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("branch or tag") && !ok)
+        );
+        let _ = s.update(HubMessage::NoteInput("ci.yml main bad".into()));
+        let _ = s.update(HubMessage::Dispatch);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("key=value"))
+        );
+    }
+
+    #[test]
+    fn replying_is_a_mode_of_the_comment_box_that_can_be_left() {
+        let mut s = state();
+        let _ = s.update(HubMessage::CommunityReplyTo(Some((9, "bob".into()))));
+        assert_eq!(s.community.reply_to, Some((9, "bob".to_string())));
+        let _ = s.update(HubMessage::CommunityReplyTo(None));
+        assert!(s.community.reply_to.is_none());
+        // Nothing is sent without an open discussion: the mode stays as it was.
+        let _ = s.update(HubMessage::CommunityReplyTo(Some((9, "bob".into()))));
+        let _ = s.update(HubMessage::CommunityComment);
+        assert!(s.community.reply_to.is_some());
+    }
+
+    #[test]
+    fn a_wiki_edit_needs_a_repo_a_page_or_a_title_and_opens_its_file_once() {
+        use gitkraft_hub::community::{Page, Tab};
+        let mut s = state();
+        let _ = s.update(HubMessage::WikiEdit);
+        assert!(s.take_draft_to_open().is_none(), "no repository yet");
+        s.community.repo = Some(RepoId::new("codeberg.org", "o", "r"));
+        let _ = s.update(HubMessage::WikiEdit);
+        assert!(
+            s.notice.as_ref().is_some_and(|(t, _)| t.contains("wiki")),
+            "{:?}",
+            s.notice
+        );
+        s.community.tab = Tab::Wiki;
+        let _ = s.update(HubMessage::WikiEdit);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("open a wiki page"))
+        );
+        s.community.page = Some(Page {
+            key: "Home".into(),
+            title: "Home".into(),
+            text: "# Hi".into(),
+            comments: Vec::new(),
+        });
+        let _ = s.update(HubMessage::WikiEdit);
+        let path = s.take_draft_to_open().expect("file to open");
+        assert_eq!(std::fs::read_to_string(&path).unwrap_or_default(), "# Hi");
+        assert!(s.take_draft_to_open().is_none(), "only once");
+
+        // A new page needs the title typed first.
+        let _ = s.update(HubMessage::WikiNew);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| !ok && t.contains("title"))
+        );
+        let _ = s.update(HubMessage::NoteInput("Roadmap".into()));
+        let _ = s.update(HubMessage::WikiNew);
+        assert!(s.take_draft_to_open().is_some());
+        assert!(s.note.is_empty());
+        assert!(
+            s.community
+                .wiki_draft
+                .as_ref()
+                .is_some_and(|d| d.slug.is_none())
+        );
+    }
+
+    #[test]
+    fn a_review_draft_fills_the_comment_box() {
+        let mut s = state();
+        let _ = s.update(HubMessage::ReviewDrafted(Ok("a.rs:3 rename\n".into())));
+        assert_eq!(s.note, "a.rs:3 rename");
+        let _ = s.update(HubMessage::ReviewDrafted(Err("no key".into())));
+        assert_eq!(s.note, "a.rs:3 rename", "a failure keeps what is there");
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(m, ok)| m.contains("no key") && !ok)
+        );
+    }
+
+    #[test]
+    fn a_day_entry_without_an_address_says_so() {
+        let mut s = state();
+        let _ = s.update(HubMessage::OpenUrl(String::new()));
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, ok)| t.contains("no address") && !ok)
+        );
+    }
+
+    #[test]
+    fn card_buttons_do_nothing_without_a_board() {
+        let mut s = state();
+        let _ = s.update(HubMessage::CommunityNewCard);
+        let _ = s.update(HubMessage::CommunityShift(
+            gitkraft_hub::community::Shift::Up,
+        ));
+        assert_eq!(s.notice, None);
+    }
+
+    #[test]
+    fn marking_an_answer_needs_an_open_discussion() {
+        let mut s = state();
+        let _ = s.update(HubMessage::CommunityAnswer(9));
+        assert_eq!(
+            s.notice, None,
+            "no page open: nothing is sent, nothing said"
+        );
+    }
+
+    #[test]
+    fn a_finished_write_shows_its_message_or_its_error() {
+        let mut s = state();
+        let _ = s.update(HubMessage::CommunityWritten(Err("no way".into())));
+        assert_eq!(s.notice, Some(("no way".to_string(), false)));
+        let _ = s.update(HubMessage::CommunityWritten(Ok("saved".into())));
+        assert_eq!(s.notice, Some(("saved".to_string(), true)));
+    }
+
+    #[test]
+    fn a_picked_day_is_remembered_and_its_details_are_cleared_until_they_arrive() {
+        let mut s = state();
+        let today = Utc::now().date_naive();
+        let _ = s.update(HubMessage::PickDay(today));
+        assert_eq!(s.pulse.day, Some(today));
+        let other = today - chrono::Duration::days(3);
+        let _ = s.update(HubMessage::PickDay(other));
+        assert_eq!(s.pulse.day, Some(other));
+        assert!(s.pulse.day_data.is_none());
+        // an answer for a day that is no longer picked is dropped
+        let stale = Arc::new(gitkraft_hub::DayResult {
+            activity: gitkraft_platforms::model::DayActivity::empty(today),
+            errors: vec![],
+        });
+        let _ = s.update(HubMessage::DayLoaded(stale));
+        assert!(s.pulse.day_data.is_none());
+        let fresh = Arc::new(gitkraft_hub::DayResult {
+            activity: gitkraft_platforms::model::DayActivity::empty(other),
+            errors: vec!["codeberg.org: down".into()],
+        });
+        let _ = s.update(HubMessage::DayLoaded(fresh));
+        assert!(s.pulse.day_data.is_some());
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("codeberg.org"))
+        );
+    }
+
+    #[test]
+    fn stepping_days_stays_between_the_calendar_start_and_today() {
+        let mut s = state();
+        let today = Utc::now().date_naive();
+        let _ = s.update(HubMessage::StepDay(-1));
+        assert_eq!(s.pulse.day, Some(today - chrono::Duration::days(1)));
+        let _ = s.update(HubMessage::StepDay(5));
+        assert_eq!(s.pulse.day, Some(today), "never into the future");
+        let _ = s.update(HubMessage::StepDay(-10));
+        let _ = s.update(HubMessage::StepDay(0));
+        assert_eq!(s.pulse.day, Some(today), "0 is the Today button");
+        s.pulse.day = Some(today - chrono::Duration::days(370));
+        let _ = s.update(HubMessage::StepDay(-1));
+        assert_eq!(
+            s.pulse.day,
+            Some(today - chrono::Duration::days(370)),
+            "not past the calendar's year"
+        );
+    }
+
+    #[test]
+    fn community_answers_for_another_repo_or_tab_are_dropped_and_errors_are_kept() {
+        use gitkraft_hub::community::{Item, Tab};
+        let mut s = state();
+        s.community.repo = Some(RepoId::new("github.com", "o", "r"));
+        let item = |n: &str| Item {
+            key: n.into(),
+            title: format!("#{n} T"),
+            ..Item::default()
+        };
+        let _ = s.update(HubMessage::CommunityLoaded {
+            repo: "github.com/o/other".into(),
+            tab: Tab::Discussions,
+            result: Ok(vec![item("1")]),
+        });
+        assert!(s.community.items.is_none(), "another repo");
+        s.community.row = 9;
+        let _ = s.update(HubMessage::CommunityLoaded {
+            repo: "github.com/o/r".into(),
+            tab: Tab::Discussions,
+            result: Ok(vec![item("1"), item("2")]),
+        });
+        assert_eq!(s.community.row, 1, "the selection stays inside the list");
+        let _ = s.update(HubMessage::CommunityLoaded {
+            repo: "github.com/o/r".into(),
+            tab: Tab::Discussions,
+            result: Err("not supported by this platform".into()),
+        });
+        assert!(s.community.items.is_none());
+        assert_eq!(
+            s.community.error.as_deref(),
+            Some("not supported by this platform")
+        );
+        // switching tab clears and reloads; a comment on a wiki page is refused
+        let _ = s.update(HubMessage::CommunityTab(Tab::Wiki));
+        assert_eq!(s.community.tab, Tab::Wiki);
+        s.community.page = Some(gitkraft_hub::community::Page {
+            key: "home".into(),
+            ..Default::default()
+        });
+        s.note = "hi".into();
+        let _ = s.update(HubMessage::CommunityComment);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("wiki pages"))
+        );
+    }
+}

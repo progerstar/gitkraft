@@ -3,6 +3,7 @@
 //! Each sub-module owns both its domain types (`types.rs`) and its operations
 //! (`ops.rs`), re-exporting both at the module level for ergonomic access.
 
+pub mod autostart;
 pub mod branches;
 pub mod commits;
 pub mod diff;
@@ -10,9 +11,10 @@ pub mod editor;
 pub mod graph;
 pub mod ignore;
 pub mod log;
-pub mod persistence;
 pub mod remotes;
 pub mod repo;
 pub mod staging;
 pub mod stash;
-pub mod theme;
+
+// Settings and theme moved to `gitkraft-settings`; re-exported so existing paths keep working.
+pub use gitkraft_settings::{persistence, theme};

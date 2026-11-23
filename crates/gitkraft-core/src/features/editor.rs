@@ -149,6 +149,18 @@ impl Editor {
         }
     }
 
+    /// Desktop entries (Linux app-menu launchers) to start this editor with
+    /// instead of its bare binary, so it gets what the user's launcher sets up.
+    /// Lite XL's AppImage, for one, is often launched with
+    /// `env SDL_VIDEODRIVER=x11 …`; without that it opens under the Wayland
+    /// driver at another scale, and looks as if the user's settings were lost.
+    pub fn desktop_entry_ids(&self) -> &'static [&'static str] {
+        match self {
+            Editor::LiteXl => &["lite-xl.desktop", "org.lite_xl.lite_xl.desktop"],
+            _ => &[],
+        }
+    }
+
     /// Returns `true` for editors that run inside a terminal (TTY required).
     ///
     /// These editors cannot be spawned in the background from a TUI
@@ -341,6 +353,30 @@ impl Editor {
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("failed to run 'open -a {}': {}", app_name, e))?;
             return Ok(());
+        }
+
+        // Start it as the app menu does, when it has a menu entry: with the
+        // environment and executable the user's launcher sets up.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some((argv, dir)) =
+            super::desktop_entry::command_for(self.desktop_entry_ids(), file_path)
+            && let Some((cmd, args)) = argv.split_first()
+        {
+            let mut command = std::process::Command::new(cmd);
+            command
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(dir) = dir.filter(|d| d.is_dir()) {
+                command.current_dir(dir);
+            }
+            match command.spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("menu entry command '{cmd}' failed ({e}), trying the binary")
+                }
+            }
         }
 
         // Try each binary candidate in order, stopping at the first found.

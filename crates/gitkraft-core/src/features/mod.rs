@@ -6,6 +6,7 @@
 pub mod autostart;
 pub mod branches;
 pub mod commits;
+pub mod desktop_entry;
 pub mod diff;
 pub mod editor;
 pub mod graph;

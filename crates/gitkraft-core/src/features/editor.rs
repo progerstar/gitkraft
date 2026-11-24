@@ -117,7 +117,16 @@ impl Editor {
             Editor::Micro => vec!["micro".into()],
             Editor::Emacs => vec!["emacs".into()],
             Editor::VSCode => vec!["code --reuse-window".into()],
-            Editor::Zed => vec!["zed".into()],
+            Editor::Zed => {
+                // Arch and NixOS ship the CLI as `zeditor`: `zed` there is the
+                // ZFS event daemon. The official installer links it into
+                // ~/.local/bin, which desktop-launched apps often lack in PATH.
+                let mut c = vec!["zed".to_string(), "zeditor".to_string()];
+                if let Some(home) = dirs::home_dir() {
+                    c.push(home.join(".local/bin/zed").to_string_lossy().into_owned());
+                }
+                c
+            }
             Editor::Sublime => vec!["subl".into()],
             Editor::LiteXl => {
                 // The official installer puts it in ~/.local/bin, which apps
@@ -157,6 +166,9 @@ impl Editor {
     pub fn desktop_entry_ids(&self) -> &'static [&'static str] {
         match self {
             Editor::LiteXl => &["lite-xl.desktop", "org.lite_xl.lite_xl.desktop"],
+            // The distro packages, the Flatpak and the official installer all
+            // name it so, each with its own executable (`zeditor`, `flatpak run`, …).
+            Editor::Zed => &["dev.zed.Zed.desktop"],
             _ => &[],
         }
     }
@@ -221,17 +233,6 @@ impl Editor {
     /// resolves. `Editor::None` is never installed.
     #[must_use]
     pub fn is_installed(&self) -> bool {
-        let on_path = |bin: &str| {
-            let Some(cmd) = bin.split_whitespace().next() else {
-                return false;
-            };
-            let p = std::path::Path::new(cmd);
-            if p.components().count() > 1 {
-                return p.is_file();
-            }
-            std::env::var_os("PATH")
-                .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
-        };
         #[cfg(target_os = "macos")]
         if let Some(app) = self.macos_app_name() {
             let bundle = format!("{app}.app");
@@ -242,7 +243,25 @@ impl Editor {
                 return true;
             }
         }
-        self.binary_candidates().iter().any(|b| on_path(b))
+        self.installed_binary().is_some()
+    }
+
+    /// The first of [`Self::binary_candidates`] whose program exists: a path
+    /// that is a file, or a name found on `PATH`.
+    #[must_use]
+    pub fn installed_binary(&self) -> Option<String> {
+        let resolves = |bin: &str| {
+            let Some(cmd) = bin.split_whitespace().next() else {
+                return false;
+            };
+            let p = std::path::Path::new(cmd);
+            if p.components().count() > 1 {
+                return p.is_file();
+            }
+            std::env::var_os("PATH")
+                .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
+        };
+        self.binary_candidates().into_iter().find(|b| resolves(b))
     }
 
     /// `"terminal"` for editors that take over the terminal, `"window"` for the others.
@@ -530,7 +549,18 @@ mod tests {
             Editor::VSCode.binary_candidates(),
             vec!["code --reuse-window"]
         );
-        assert_eq!(Editor::Zed.binary_candidates(), vec!["zed"]);
+    }
+
+    #[test]
+    fn zed_is_found_under_its_distro_name_and_its_menu_entry() {
+        let c = Editor::Zed.binary_candidates();
+        assert_eq!(c[..2], ["zed", "zeditor"]);
+        assert_eq!(Editor::Zed.binary(), Some("zed".into()));
+        assert!(
+            Editor::Zed
+                .desktop_entry_ids()
+                .contains(&"dev.zed.Zed.desktop")
+        );
     }
 
     #[test]
@@ -606,7 +636,13 @@ mod tests {
         assert!(!Editor::Custom("definitely-not-an-editor-xyz".into()).is_installed());
         // a path that certainly exists on every OS: this test binary
         let me = std::env::current_exe().expect("exe");
-        assert!(Editor::Custom(format!("{} -x", me.display())).is_installed());
+        let custom = format!("{} -x", me.display());
+        assert!(Editor::Custom(custom.clone()).is_installed());
+        assert_eq!(
+            Editor::Custom(custom.clone()).installed_binary(),
+            Some(custom)
+        );
+        assert_eq!(Editor::None.installed_binary(), None);
         assert_eq!(Editor::Vim.kind_label(), "terminal");
         assert_eq!(Editor::Zed.kind_label(), "window");
     }

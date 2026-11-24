@@ -119,7 +119,10 @@ pub fn invocation(
         HarnessKind::Zed => {
             let file = scratch.join("agent-watch-prompt.md");
             Some(Invocation {
-                program: "zed".into(),
+                // `zeditor` on Arch and NixOS; "zed" names it in the error when none is found.
+                program: gitkraft_core::Editor::Zed
+                    .installed_binary()
+                    .unwrap_or_else(|| "zed".into()),
                 args: vec![file.display().to_string()],
                 prompt_file: Some(file),
             })

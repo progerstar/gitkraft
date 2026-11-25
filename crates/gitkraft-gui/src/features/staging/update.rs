@@ -126,35 +126,35 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             )
         }
 
-        Message::DiscardFile(path) => {
-            state.active_tab_mut().pending_discard = None;
-            with_repo!(
-                state,
-                dismiss,
-                format!("Discarding '{path}'…"),
-                |repo_path| commands::discard_file(repo_path, path)
-            )
-        }
-
-        Message::AskDiscard(path) => {
-            state.active_tab_mut().pending_discard = Some(path);
+        Message::AskDiscard(paths) => {
+            let tab = state.active_tab_mut();
+            tab.context_menu = None;
+            tab.pending_discard = paths;
             Task::none()
         }
 
-        Message::ConfirmDiscard(path) => {
+        Message::ConfirmDiscard => {
+            let paths = std::mem::take(&mut state.active_tab_mut().pending_discard);
+            if paths.is_empty() {
+                return Task::none();
+            }
+            let tab = state.active_tab_mut();
+            tab.selected_unstaged.retain(|p| !paths.contains(p));
+            tab.selected_staged.retain(|p| !paths.contains(p));
+            let what = match paths.as_slice() {
+                [one] => format!("'{one}'"),
+                many => format!("{} files", many.len()),
+            };
             with_repo!(
                 state,
-                format!("Discarding changes in '{path}'…"),
-                |repo_path| {
-                    state.active_tab_mut().pending_discard = None;
-                    commands::discard_file(repo_path, path)
-                }
+                format!("Discarding changes in {what}…"),
+                |repo_path| commands::discard_files(repo_path, paths)
             )
         }
 
         Message::CancelDiscard => {
             let tab = state.active_tab_mut();
-            tab.pending_discard = None;
+            tab.pending_discard.clear();
             tab.status_message = None;
             Task::none()
         }
@@ -257,31 +257,6 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             )
         }
 
-        Message::DiscardSelected => {
-            let unstaged_paths: Vec<String> = state
-                .active_tab()
-                .selected_unstaged
-                .iter()
-                .cloned()
-                .collect();
-            let staged_paths: Vec<String> =
-                state.active_tab().selected_staged.iter().cloned().collect();
-
-            if unstaged_paths.is_empty() && staged_paths.is_empty() {
-                return Task::none();
-            }
-
-            let total = unstaged_paths.len() + staged_paths.len();
-            state.active_tab_mut().selected_unstaged.clear();
-            state.active_tab_mut().selected_staged.clear();
-            with_repo!(
-                state,
-                dismiss,
-                format!("Discarding {} file(s)…", total),
-                |repo_path| commands::discard_all_selected(repo_path, unstaged_paths, staged_paths)
-            )
-        }
-
         Message::AddToGitignore(target) => with_repo!(
             state,
             dismiss,
@@ -340,15 +315,6 @@ pub(crate) fn update(state: &mut GitKraft, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::DiscardStagedFile(path) => {
-            with_repo!(
-                state,
-                dismiss,
-                format!("Discarding '{path}'…"),
-                |repo_path| commands::discard_staged_file(repo_path, path)
-            )
-        }
-
         _ => Task::none(),
     }
 }
@@ -382,6 +348,42 @@ mod tests {
             staged: Vec::new(),
         };
         let _ = state.update(Message::GitignoreUpdated(target, Ok((added, payload))));
+    }
+
+    #[test]
+    fn discarding_several_files_asks_first_then_discards_them_all() {
+        let mut state = GitKraft::new();
+        let tab = state.active_tab_mut();
+        tab.repo_path = Some("/tmp/fake-repo-for-test".into());
+        tab.unstaged_changes = vec![
+            entry("a.rs", FileStatus::Modified),
+            entry("b.rs", FileStatus::Modified),
+            entry("c.rs", FileStatus::Modified),
+        ];
+        tab.selected_unstaged = ["a.rs", "b.rs", "c.rs"].map(String::from).into();
+        tab.context_menu = Some(ContextMenu::UnstagedFile {
+            path: "a.rs".into(),
+        });
+
+        let _ = state.update(Message::AskDiscard(vec!["a.rs".into(), "b.rs".into()]));
+        let tab = state.active_tab();
+        assert!(tab.context_menu.is_none());
+        assert_eq!(tab.pending_discard, ["a.rs", "b.rs"]);
+
+        let _ = state.update(Message::ConfirmDiscard);
+        let tab = state.active_tab();
+        assert!(tab.pending_discard.is_empty());
+        assert_eq!(
+            tab.status_message.as_deref(),
+            Some("Discarding changes in 2 files…")
+        );
+        // The discarded files leave the selection; the rest stay selected.
+        assert_eq!(tab.selected_unstaged, ["c.rs".to_string()].into());
+
+        // Nothing pending: confirming again does nothing.
+        state.active_tab_mut().status_message = None;
+        let _ = state.update(Message::ConfirmDiscard);
+        assert_eq!(state.active_tab().status_message, None);
     }
 
     #[test]

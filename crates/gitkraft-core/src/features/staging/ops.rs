@@ -141,6 +141,45 @@ pub fn discard_file_changes(repo: &Repository, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Throw away every change to `paths`, staged or not, so that each file is
+/// back to what HEAD has: a file HEAD has is unstaged and restored, a file it
+/// does not have (untracked, or added to the index only) is unstaged and
+/// deleted from disk. Directories (an untracked nested repository, say) are
+/// left alone.
+///
+/// **Warning:** this is destructive — the changes cannot be recovered.
+pub fn discard_paths(repo: &Repository, paths: &[String]) -> Result<()> {
+    debug!("discarding all changes to: {:?}", paths);
+    let workdir = repo
+        .workdir()
+        .context("repository has no working directory")?
+        .to_path_buf();
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    for path in paths {
+        let in_head = head_tree
+            .as_ref()
+            .is_some_and(|t| t.get_path(Path::new(path)).is_ok());
+        let in_index = repo
+            .index()
+            .context("failed to read index")?
+            .get_path(Path::new(path), 0)
+            .is_some();
+        if in_head || in_index {
+            unstage_file(repo, path)?;
+        }
+        if in_head {
+            discard_file_changes(repo, path)?;
+        } else {
+            let full = workdir.join(path);
+            if full.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                std::fs::remove_file(&full)
+                    .with_context(|| format!("failed to delete '{path}'"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Stop tracking files (`git rm --cached`): remove them from the index and
 /// leave them on disk. A file in HEAD then shows as a staged deletion until
 /// the next commit. Paths not in the index are skipped.
@@ -270,6 +309,84 @@ mod tests {
 
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content.replace("\r\n", "\n"), "hello world\n");
+    }
+
+    #[test]
+    fn discard_paths_leaves_the_files_as_head_has_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let dir = tmp.path();
+        // A second committed file, to delete from the working tree.
+        fs::write(dir.join("gone.txt"), "committed\n").unwrap();
+        stage_file(&repo, "gone.txt").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&head])
+                .unwrap();
+        }
+
+        // Partly staged: one change staged, another on top in the work tree.
+        fs::write(dir.join("hello.txt"), "staged\n").unwrap();
+        stage_file(&repo, "hello.txt").unwrap();
+        fs::write(dir.join("hello.txt"), "staged and more\n").unwrap();
+        fs::remove_file(dir.join("gone.txt")).unwrap();
+        fs::write(dir.join("untracked.txt"), "new\n").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/added.txt"), "new\n").unwrap();
+        stage_file(&repo, "sub/added.txt").unwrap();
+        fs::write(dir.join("kept.txt"), "not selected\n").unwrap();
+
+        let paths: Vec<String> = ["hello.txt", "gone.txt", "untracked.txt", "sub/added.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        discard_paths(&repo, &paths).unwrap();
+
+        let read = |p: &str| {
+            fs::read_to_string(dir.join(p))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
+        assert_eq!(read("hello.txt"), "hello world\n");
+        assert_eq!(read("gone.txt"), "committed\n");
+        assert!(!dir.join("untracked.txt").exists());
+        assert!(!dir.join("sub/added.txt").exists());
+        // Only the unselected file is left changed.
+        let statuses = repo.statuses(None).unwrap();
+        let changed: Vec<_> = statuses
+            .iter()
+            .filter_map(|s| s.path().ok().map(String::from))
+            .collect();
+        assert_eq!(changed, ["kept.txt"]);
+    }
+
+    #[test]
+    fn discard_paths_works_before_the_first_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("a.txt"), "a\n").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+        stage_file(&repo, "a.txt").unwrap();
+
+        discard_paths(&repo, &["a.txt".into(), "b.txt".into()]).unwrap();
+
+        assert!(!tmp.path().join("a.txt").exists());
+        assert!(!tmp.path().join("b.txt").exists());
+        assert!(repo.index().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_paths_leaves_directories_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        Repository::init(tmp.path().join("vendor")).unwrap();
+
+        discard_paths(&repo, &["vendor/".into()]).unwrap();
+
+        assert!(tmp.path().join("vendor/.git").exists());
     }
 
     #[test]

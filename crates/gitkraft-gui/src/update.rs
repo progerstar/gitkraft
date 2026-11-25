@@ -320,9 +320,8 @@ impl GitKraft {
             | Message::UnstageFile(_)
             | Message::StageAll
             | Message::UnstageAll
-            | Message::DiscardFile(_)
             | Message::AskDiscard(_)
-            | Message::ConfirmDiscard(_)
+            | Message::ConfirmDiscard
             | Message::CancelDiscard
             | Message::StagingUpdated(_)
             | Message::StagedAll(_)
@@ -330,8 +329,6 @@ impl GitKraft {
             | Message::ToggleSelectStaged(_)
             | Message::StageSelected
             | Message::UnstageSelected
-            | Message::DiscardSelected
-            | Message::DiscardStagedFile(_)
             | Message::AddToGitignore(_)
             | Message::GitignoreUpdated(..)
             | Message::ConfirmUntrack
@@ -1715,7 +1712,7 @@ impl GitKraft {
                 // Escape also closes the branch dropdown and pending confirmations.
                 self.branch_popup_open = false;
                 let tab = self.active_tab_mut();
-                tab.pending_discard = None;
+                tab.pending_discard.clear();
                 tab.pending_delete_file = None;
                 tab.pending_untrack.clear();
                 tab.blame_path = None;

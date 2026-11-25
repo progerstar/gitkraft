@@ -200,8 +200,9 @@ pub struct RepoTab {
     /// arrow keys on screen (`None` until the list first overflows).
     pub changes_list_viewport: Option<crate::features::github_layout::changes::ListViewport>,
 
-    /// File path pending discard confirmation (None = no pending discard).
-    pub pending_discard: Option<String>,
+    /// Files whose changes wait for the user to confirm a discard (empty =
+    /// no pending discard).
+    pub pending_discard: Vec<String>,
     /// Tracked files a new `.gitignore` rule covers: git keeps tracking them,
     /// so a banner offers `git rm --cached` (empty = no banner).
     pub pending_untrack: Vec<String>,
@@ -342,7 +343,7 @@ impl RepoTab {
             anchor_staged_index: None,
             changes_selection: Default::default(),
             changes_list_viewport: None,
-            pending_discard: None,
+            pending_discard: Vec::new(),
             pending_untrack: Vec::new(),
             status_message: None,
             error_message: None,

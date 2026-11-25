@@ -267,7 +267,7 @@ pub(crate) fn discard_or_delete(entry: &gitkraft_core::DiffFileEntry) -> crate::
     if entry.status == gitkraft_core::FileStatus::Untracked {
         crate::message::Message::DeleteFile(path)
     } else {
-        crate::message::Message::AskDiscard(path)
+        crate::message::Message::AskDiscard(vec![path])
     }
 }
 

@@ -139,12 +139,11 @@ pub enum Message {
     StageAll,
     /// Unstage all staged files.
     UnstageAll,
-    /// Discard working-directory changes for a file.
-    DiscardFile(String),
-    /// Ask before discarding a file's working-tree changes (shows a banner).
-    AskDiscard(String),
-    /// User confirmed the discard for a file.
-    ConfirmDiscard(String),
+    /// Ask before discarding all changes to these files, staged or not
+    /// (shows a banner).
+    AskDiscard(Vec<String>),
+    /// User confirmed the pending discard.
+    ConfirmDiscard,
     /// User cancelled a pending discard.
     CancelDiscard,
     /// Toggle selection of an unstaged file (Shift+Click).
@@ -155,10 +154,6 @@ pub enum Message {
     StageSelected,
     /// Unstage all currently selected staged files.
     UnstageSelected,
-    /// Discard all currently selected unstaged files.
-    DiscardSelected,
-    /// Discard a staged file (unstage + discard working dir changes).
-    DiscardStagedFile(String),
     /// Async staging operation completed.
     StagingUpdated(Result<StagingPayload, String>),
     /// "Stage all" completed: the nested repositories it skipped, and the

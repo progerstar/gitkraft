@@ -408,7 +408,7 @@ mod tests {
         let untracked = entry("new.rs", FileStatus::Untracked);
         assert!(matches!(
             view_utils::discard_or_delete(&tracked),
-            Message::AskDiscard(p) if p == "a.rs"
+            Message::AskDiscard(p) if p == ["a.rs"]
         ));
         assert!(matches!(
             view_utils::discard_or_delete(&untracked),
@@ -416,10 +416,10 @@ mod tests {
         ));
 
         let mut state = GitKraft::new();
-        let _ = state.update(Message::AskDiscard("a.rs".into()));
-        assert_eq!(state.active_tab().pending_discard.as_deref(), Some("a.rs"));
+        let _ = state.update(Message::AskDiscard(vec!["a.rs".into()]));
+        assert_eq!(state.active_tab().pending_discard, ["a.rs"]);
         let _ = state.update(Message::CancelDiscard);
-        assert!(state.active_tab().pending_discard.is_none());
+        assert!(state.active_tab().pending_discard.is_empty());
     }
 
     #[test]

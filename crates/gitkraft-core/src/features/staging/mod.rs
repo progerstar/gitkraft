@@ -3,5 +3,6 @@
 mod ops;
 
 pub use ops::{
-    discard_file_changes, stage_all, stage_file, unstage_all, unstage_file, untrack_files,
+    discard_file_changes, discard_paths, stage_all, stage_file, unstage_all, unstage_file,
+    untrack_files,
 };

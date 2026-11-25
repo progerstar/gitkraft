@@ -224,8 +224,8 @@ impl GitKraft {
             banners = banners.push(delete_confirmation_banner(file_name, &c));
         }
 
-        if let Some(ref path) = tab.pending_discard {
-            banners = banners.push(discard_confirmation_banner(path, &c));
+        if !tab.pending_discard.is_empty() {
+            banners = banners.push(discard_confirmation_banner(tab, &c));
         }
 
         if !tab.pending_untrack.is_empty() {
@@ -416,21 +416,54 @@ fn status_bar_view(state: &GitKraft) -> Element<'_, Message> {
         .into()
 }
 
-/// "Discard changes in …?" confirmation (the change cannot be recovered).
-fn discard_confirmation_banner<'a>(path: &str, c: &ThemeColors) -> Element<'a, Message> {
+/// Whether `path` is a file HEAD does not have (untracked or newly added):
+/// discarding it deletes it.
+fn is_new_file(tab: &crate::state::RepoTab, path: &str) -> bool {
+    use gitkraft_core::FileStatus;
+    tab.unstaged_changes
+        .iter()
+        .chain(&tab.staged_changes)
+        .any(|e| {
+            e.display_path() == path && matches!(e.status, FileStatus::Untracked | FileStatus::New)
+        })
+}
+
+/// Question of the discard banner for the files `tab.pending_discard`,
+/// naming the new files the discard deletes.
+fn discard_question(tab: &crate::state::RepoTab) -> String {
+    let paths = &tab.pending_discard;
+    let new_files = paths.iter().filter(|p| is_new_file(tab, p)).count();
+    let question = match paths.as_slice() {
+        [one] if new_files == 1 => format!(
+            "Delete the new file '{}'?",
+            gitkraft_core::path_basename(one)
+        ),
+        [one] => format!(
+            "Discard changes in '{}'?",
+            gitkraft_core::path_basename(one)
+        ),
+        many if new_files == 0 => format!("Discard changes in {} files?", many.len()),
+        many => format!(
+            "Discard changes in {} files? {new_files} new file(s) among them will be deleted.",
+            many.len()
+        ),
+    };
+    format!("{question} This cannot be undone.")
+}
+
+/// "Discard changes in …?" confirmation (the changes cannot be recovered).
+fn discard_confirmation_banner<'a>(
+    tab: &crate::state::RepoTab,
+    c: &ThemeColors,
+) -> Element<'a, Message> {
     use iced::widget::{Space, button, row, text};
 
-    let label = text(format!(
-        "Discard changes in '{}'? This cannot be undone.",
-        gitkraft_core::path_basename(path)
-    ))
-    .size(13)
-    .color(c.text_primary);
+    let label = text(discard_question(tab)).size(13).color(c.text_primary);
 
     let confirm_btn = button(text("Discard").size(12).color(c.red))
         .padding([3, 12])
         .style(theme::toolbar_button)
-        .on_press(Message::ConfirmDiscard(path.to_string()));
+        .on_press(Message::ConfirmDiscard);
 
     let cancel_btn = button(text("Cancel").size(12).color(c.text_secondary))
         .padding([3, 12])
@@ -983,22 +1016,9 @@ fn file_context_menu_items<'a>(
 ) -> iced::widget::Column<'a, Message> {
     use iced::widget::column;
 
-    let tab = state.active_tab();
-
-    let (selected_count, changes, selected) = if staged {
-        (
-            tab.selected_staged.len(),
-            &tab.staged_changes,
-            &tab.selected_staged,
-        )
-    } else {
-        (
-            tab.selected_unstaged.len(),
-            &tab.unstaged_changes,
-            &tab.selected_unstaged,
-        )
-    };
-
+    // The files the menu acts on: all selected rows, or just this one.
+    let selected_paths = file_menu_paths(state, path, staged);
+    let selected_count = selected_paths.len();
     let is_multi = selected_count > 1;
 
     let header_text = if is_multi {
@@ -1012,38 +1032,33 @@ fn file_context_menu_items<'a>(
     let mut col = column![header];
 
     if is_multi {
-        // Collect selected file paths
-        let selected_paths: Vec<String> = changes
-            .iter()
-            .filter(|d| selected.contains(d.display_path()))
-            .map(|d| d.display_path().to_string())
-            .collect();
-
-        let action_label = if staged { "Unstage" } else { "Stage" };
-        let action_msg = if staged {
-            Message::UnstageSelected
-        } else {
-            Message::StageSelected
-        };
-
-        // Batch operations for multi-select
-        col = col.push(menu_item(
-            &format!("{} {} file(s)", action_label, selected_count),
-            action_msg,
-        ));
-        col = col.push(view_utils::context_menu_separator::<Message>());
+        // Batch operations for multi-select. Stage / Unstage Selected act on
+        // the classic lists' selections; the GitHub Desktop layout stages
+        // its selection with Space and the checkboxes.
+        if state.layout_style == LayoutStyle::Classic {
+            let (action_label, action_msg) = if staged {
+                ("Unstage", Message::UnstageSelected)
+            } else {
+                ("Stage", Message::StageSelected)
+            };
+            col = col.push(menu_item(
+                &format!("{} {} file(s)", action_label, selected_count),
+                action_msg,
+            ));
+            col = col.push(view_utils::context_menu_separator::<Message>());
+        }
         col = col.push(menu_item(
             &format!("Open {} file(s) in editor", selected_count),
             Message::OpenFilesInEditor(selected_paths.clone()),
         ));
         col = col.push(menu_item(
             &format!("Open {} file(s)", selected_count),
-            Message::OpenFilesInDefaultProgram(selected_paths),
+            Message::OpenFilesInDefaultProgram(selected_paths.clone()),
         ));
         col = col.push(view_utils::context_menu_separator::<Message>());
         col = col.push(menu_item(
-            &format!("Discard {} file(s)", selected_count),
-            Message::DiscardSelected,
+            &format!("Discard changes in {} files\u{2026}", selected_count),
+            Message::AskDiscard(selected_paths.clone()),
         ));
     } else {
         // Single file operations
@@ -1079,27 +1094,21 @@ fn file_context_menu_items<'a>(
                 "Unstage file",
                 Message::UnstageFile(path.to_string()),
             ));
-            col = col.push(view_utils::context_menu_separator::<Message>());
-            col = col.push(menu_item(
-                "Discard changes",
-                Message::DiscardStagedFile(path.to_string()),
-            ));
         } else {
             col = col.push(menu_item(
                 "Stage file",
                 Message::StageFile(path.to_string()),
             ));
-            col = col.push(view_utils::context_menu_separator::<Message>());
-            col = col.push(menu_item(
-                "Discard changes",
-                Message::DiscardFile(path.to_string()),
-            ));
         }
+        col = col.push(view_utils::context_menu_separator::<Message>());
+        col = col.push(menu_item(
+            "Discard changes\u{2026}",
+            Message::AskDiscard(vec![path.to_string()]),
+        ));
     }
 
     // Add to .gitignore, as in GitHub Desktop.
-    let ignore_paths = gitignore_menu_paths(state, path, staged);
-    let ignore_entries = gitignore_menu_entries(&ignore_paths);
+    let ignore_entries = gitignore_menu_entries(&selected_paths);
     if !ignore_entries.is_empty() {
         col = col.push(view_utils::context_menu_separator::<Message>());
         for (label, msg) in ignore_entries {
@@ -1134,9 +1143,9 @@ fn file_context_menu_items<'a>(
     col
 }
 
-/// Files the "add to .gitignore" items act on: every selected row when the
+/// Files a changed file's context menu acts on: every selected row when the
 /// right-clicked file is one of several selected, otherwise just that file.
-fn gitignore_menu_paths(state: &GitKraft, path: &str, staged: bool) -> Vec<String> {
+fn file_menu_paths(state: &GitKraft, path: &str, staged: bool) -> Vec<String> {
     let tab = state.active_tab();
     if state.layout_style == LayoutStyle::GitHubDesktop {
         let selection = &tab.changes_selection;
@@ -1743,14 +1752,11 @@ mod tests {
         tab.changes_selection.paths = ["c.rs", "a.rs"].map(String::from).into();
 
         // Rows are listed in Changes-list order.
-        assert_eq!(
-            gitignore_menu_paths(&state, "c.rs", false),
-            ["a.rs", "c.rs"]
-        );
-        assert_eq!(gitignore_menu_paths(&state, "b.rs", false), ["b.rs"]);
+        assert_eq!(file_menu_paths(&state, "c.rs", false), ["a.rs", "c.rs"]);
+        assert_eq!(file_menu_paths(&state, "b.rs", false), ["b.rs"]);
 
         state.active_tab_mut().changes_selection.paths = ["a.rs"].map(String::from).into();
-        assert_eq!(gitignore_menu_paths(&state, "a.rs", false), ["a.rs"]);
+        assert_eq!(file_menu_paths(&state, "a.rs", false), ["a.rs"]);
     }
 
     #[test]
@@ -1762,20 +1768,56 @@ mod tests {
     }
 
     #[test]
+    fn discard_question_names_one_file_counts_several_and_the_new_ones() {
+        use gitkraft_core::{DiffFileEntry, FileStatus};
+        let with = |path: &str, status| DiffFileEntry {
+            old_file: path.into(),
+            new_file: path.into(),
+            status,
+        };
+        let mut state = GitKraft::new();
+        let tab = state.active_tab_mut();
+        tab.unstaged_changes = vec![
+            with("src/a.rs", FileStatus::Modified),
+            with("new.rs", FileStatus::Untracked),
+        ];
+        tab.staged_changes = vec![with("added.rs", FileStatus::New)];
+        let question = |state: &mut GitKraft, files: &[&str]| {
+            state.active_tab_mut().pending_discard = paths(files);
+            discard_question(state.active_tab())
+        };
+
+        assert_eq!(
+            question(&mut state, &["src/a.rs"]),
+            "Discard changes in 'a.rs'? This cannot be undone."
+        );
+        assert_eq!(
+            question(&mut state, &["new.rs"]),
+            "Delete the new file 'new.rs'? This cannot be undone."
+        );
+        assert_eq!(
+            question(&mut state, &["src/a.rs", "added.rs"]),
+            "Discard changes in 2 files? 1 new file(s) among them will be deleted. \
+             This cannot be undone."
+        );
+        assert_eq!(
+            question(&mut state, &["src/a.rs", "src/a.rs"]),
+            "Discard changes in 2 files? This cannot be undone."
+        );
+    }
+
+    #[test]
     fn classic_menu_covers_the_selected_files_of_its_list() {
         let mut state = GitKraft::new();
         state.layout_style = LayoutStyle::Classic;
         let tab = state.active_tab_mut();
         tab.unstaged_changes = vec![entry("a.rs"), entry("b.rs")];
         tab.staged_changes = vec![entry("s.rs")];
-        assert_eq!(gitignore_menu_paths(&state, "a.rs", false), ["a.rs"]);
+        assert_eq!(file_menu_paths(&state, "a.rs", false), ["a.rs"]);
 
         state.active_tab_mut().selected_unstaged = ["a.rs", "b.rs"].map(String::from).into();
-        assert_eq!(
-            gitignore_menu_paths(&state, "a.rs", false),
-            ["a.rs", "b.rs"]
-        );
-        assert_eq!(gitignore_menu_paths(&state, "s.rs", true), ["s.rs"]);
+        assert_eq!(file_menu_paths(&state, "a.rs", false), ["a.rs", "b.rs"]);
+        assert_eq!(file_menu_paths(&state, "s.rs", true), ["s.rs"]);
     }
 
     /// Addresses of the widget states held in `tree`, to tell whether a
@@ -1834,7 +1876,7 @@ mod tests {
                 s.active_tab_mut().pending_delete_file = Some("a.rs".into());
             }));
             assert!(keeps(|s| {
-                s.active_tab_mut().pending_discard = Some("a.rs".into());
+                s.active_tab_mut().pending_discard = vec!["a.rs".into()];
             }));
             assert!(keeps(|s| {
                 s.active_tab_mut().pending_untrack = vec!["a.rs".into()];

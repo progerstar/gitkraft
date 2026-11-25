@@ -111,7 +111,7 @@ fn changes_keys_active(state: &GitKraft) -> bool {
     changes_list_shown(state)
         && tab.repo_path.is_some()
         && tab.context_menu.is_none()
-        && tab.pending_discard.is_none()
+        && tab.pending_discard.is_empty()
         && tab.pending_untrack.is_empty()
         && !state.branch_popup_open
 }
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(state.active_tab().status_message, None);
 
         state.ghd_tab = GhdTab::Changes;
-        state.active_tab_mut().pending_discard = Some("a".into());
+        state.active_tab_mut().pending_discard = vec!["a".into()];
         let _ = state.update(Message::ToggleSelectedChangesStaged);
         assert_eq!(state.active_tab().status_message, None);
     }

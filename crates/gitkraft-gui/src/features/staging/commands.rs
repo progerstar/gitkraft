@@ -45,12 +45,13 @@ pub(crate) fn unstage_all(path: PathBuf) -> Task<Message> {
     ))
 }
 
-/// Discard working-directory changes for a single file, then return the
-/// refreshed staging state.
-pub(crate) fn discard_file(path: PathBuf, file_path: String) -> Task<Message> {
-    staging_op!(path, |repo| {
-        gitkraft_core::features::staging::discard_file_changes(&repo, &file_path)
-    })
+/// Throw away all changes to `file_paths`, staged or not (new files are
+/// deleted), then return the refreshed staging state.
+pub(crate) fn discard_files(path: PathBuf, file_paths: Vec<String>) -> Task<Message> {
+    staging_op!(
+        path,
+        |repo| gitkraft_core::features::staging::discard_paths(&repo, &file_paths)
+    )
 }
 
 /// Stage multiple files at once.
@@ -76,42 +77,6 @@ pub(crate) fn unstage_files(path: PathBuf, file_paths: Vec<String>) -> Task<Mess
             for fp in &file_paths {
                 gitkraft_core::features::staging::unstage_file(&repo, fp).str_err()?;
             }
-            refresh_staging_state(&path)
-        })()
-    )
-}
-
-/// Discard changes for both unstaged and staged files.
-/// Staged files are first unstaged, then discarded.
-pub(crate) fn discard_all_selected(
-    path: PathBuf,
-    unstaged_paths: Vec<String>,
-    staged_paths: Vec<String>,
-) -> Task<Message> {
-    git_task!(
-        Message::StagingUpdated,
-        (|| {
-            let repo = open_repo!(&path);
-            for fp in &unstaged_paths {
-                gitkraft_core::features::staging::discard_file_changes(&repo, fp).str_err()?;
-            }
-            for fp in &staged_paths {
-                gitkraft_core::features::staging::unstage_file(&repo, fp).str_err()?;
-                gitkraft_core::features::staging::discard_file_changes(&repo, fp).str_err()?;
-            }
-            refresh_staging_state(&path)
-        })()
-    )
-}
-
-/// Discard a staged file by first unstaging, then discarding working dir changes.
-pub(crate) fn discard_staged_file(path: PathBuf, file_path: String) -> Task<Message> {
-    git_task!(
-        Message::StagingUpdated,
-        (|| {
-            let repo = open_repo!(&path);
-            gitkraft_core::features::staging::unstage_file(&repo, &file_path).str_err()?;
-            gitkraft_core::features::staging::discard_file_changes(&repo, &file_path).str_err()?;
             refresh_staging_state(&path)
         })()
     )
